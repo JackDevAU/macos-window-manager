@@ -1,0 +1,1503 @@
+package main
+
+import "base:runtime"
+import "core:c"
+import "core:fmt"
+import "core:slice"
+import "core:strconv"
+import "core:strings"
+import "core:sys/posix"
+import CF "core:sys/darwin/CoreFoundation"
+import "layout"
+import mac "macos"
+
+// A managed window: the strip refers to it by Window_Id; this is the real thing.
+Managed :: struct {
+	pid:     i32,
+	ax:      mac.AXUIElement, // retained
+	title:   string, // allocated
+	app:     string, // allocated (owning app name)
+	mon:     int, // which monitor (index into g.monitors) this window tiles on
+	ws:      int, // workspace within that monitor
+	hidden:  bool, // hidden by us (so reconcile won't mistake it for closed)
+	floated: bool, // user-excluded from tiling (Alt+F) — left where it is
+	req_w:   f64, // width we last asked this window to be (to detect clamping)
+	orig:    layout.Rect, // frame when first managed, restored on un-tile
+}
+
+Workspace :: struct {
+	strip: layout.Strip,
+}
+
+// A physical display with its own independent tiling area (niri's per-output
+// model): its usable viewport and its own set of workspaces. Every monitor is
+// always laid out — unlike workspaces, where only the focused one shows.
+Monitor :: struct {
+	display_id: u32,
+	viewport:   layout.Rect, // this display's usable area (below its bar)
+	bar_rect:   layout.Rect, // status bar strip across the top of this display
+	workspaces: [dynamic]Workspace,
+	focused_ws: int,
+}
+
+Layout_Mode :: enum {
+	Columns, // niri scrollable strip
+	Monocle, // one window (the focused column) fills the screen; others scroll off
+	Grid, // all windows in a grid
+}
+
+// Daemon state. Single instance, global so the IPC/hotkey/timer callbacks reach
+// it. Windows live across emulated workspaces; only the focused one is laid out.
+Daemon :: struct {
+	monitors:        [dynamic]Monitor, // one per physical display, ordered left→right
+	focused_monitor: int,
+	reg:        map[layout.Window_Id]Managed,
+	next_id:    u64,
+	live:           bool, // false => dry-run effector (default)
+	manage_app:     string,
+	hide_offscreen: bool, // off-view windows: park off-screen (no animation) vs minimize
+	mode:           Layout_Mode, // columns (scrollable strip) vs grid
+	ignore_apps:    map[string]bool, // app names never adopted into tiling (keys allocated)
+	menu_h:         f64, // native menu-bar height; clicks above it pass through to it
+}
+
+@(private = "file")
+g: Daemon
+@(private = "file")
+g_listen_fd: posix.FD
+@(private = "file")
+g_tap: mac.CFMachPort
+// After we set focus ourselves (a hotkey raise), skip this many fast ticks of
+// click-sync so it can't snap focus back before our raise has taken effect.
+@(private = "file")
+g_focus_hold: int
+
+// Countdown of fast ticks during which we try to sync the daemon's focus to the
+// OS-frontmost window. Armed ONLY by a real mouse click (so it never fights
+// hotkey navigation, which was the reason continuous polling was reverted). It
+// takes a tick or two for the OS to make the clicked window frontmost.
+@(private = "file")
+g_click_sync: int
+
+// The managed window we last followed the OS focus to. Lets the fast tick act only
+// when the OS-frontmost window *changes* (native Cmd+Tab, Raycast, Spotlight, Dock),
+// instead of re-syncing every tick. Updated whenever we deliberately focus a window.
+@(private = "file")
+g_last_synced_id: layout.Window_Id
+
+FOCUS_HOLD_TICKS :: 3
+CLICK_SYNC_TICKS :: 4
+
+GAP :: 12
+IDLE_MS :: 500
+FOCUS_MS :: 120
+BAR_H :: 28
+
+// Windows smaller than this in either dimension are treated as alerts /
+// notification popups and left floating (not adopted into the tiling strip).
+MIN_TILE_W :: 200
+MIN_TILE_H :: 120
+
+// A window that comes back this many px narrower than we asked is treated as
+// width-constrained (e.g. System Settings); neighbours pack against its real
+// width so there's no gap.
+WIDTH_TOL :: 24
+
+// Virtual keycodes (ANSI) for the default Alt-based keymap.
+KEY_H :: 4
+KEY_J :: 38
+KEY_K :: 40
+KEY_L :: 37
+KEY_R :: 15
+KEY_COMMA :: 43
+KEY_PERIOD :: 47
+KEY_T :: 17
+KEY_M :: 46
+KEY_G :: 5
+KEY_F :: 3 // toggle floating (exclude focused window from tiling)
+KEY_S :: 1 // open the settings window
+KEY_P :: 35 // mirror the focused window onto the share stage
+KEY_Z :: 6 // toggle fullscreen / monocle (one window per screen)
+
+HOTKEYS_TEXT :: `Alt + h/j/k/l               focus left / down / up / right
+Alt + Shift + h/l           move column left / right
+Alt + Shift + j/k           focus next / prev monitor
+Alt + Ctrl + j/k            move focused window to next / prev monitor
+Alt + r                    cycle column width (1/3 · 1/2 · 2/3)
+Alt + m                    maximize column width
+Alt + z                    fullscreen: one window per screen (toggle)
+Alt + g                    toggle grid / columns
+Alt + f                    float / unfloat the focused window
+Alt + , / .                consume / expel within a column
+Alt + Shift + ,            dock window with its same-app siblings
+Alt + 1 – 9                focus window n
+Alt + Shift + 1 – 9        move focused window to slot n
+Ctrl + 1 – 9               switch to workspace n
+Ctrl + Shift + 1 – 9       move focused window to workspace n
+Alt + t                    pause / resume tiling
+Alt + s                    open this settings window
+Alt + p                    mirror the focused window to the share Stage
+Cmd + Tab                  native macOS switcher (the WM follows your pick)`
+KEY_TAB :: 48 // used with Cmd for the window switcher
+
+run_daemon :: proc(manage_app: string = "") {
+	g.reg = make(map[layout.Window_Id]Managed)
+	g.ignore_apps = make(map[string]bool)
+	build_monitors() // one independent tiling area per physical display
+	g.live = true // start tiling immediately (use `wm live off` / Alt+T to pause)
+	g.manage_app = manage_app
+	g.hide_offscreen = true // no-SIP smooth hide (no minimize animation)
+	mac.wm_settings_set_handler(settings_cmd_cb) // settings-window buttons drive daemon commands
+
+	listen_fd, ok := ipc_listen()
+	if !ok {
+		fmt.eprintln("could not open IPC socket")
+		return
+	}
+	g_listen_fd = listen_fd
+
+	rl := mac.CFRunLoopGetCurrent()
+
+	// IPC socket as a run-loop source.
+	fdref := mac.CFFileDescriptorCreate(nil, c.int(listen_fd), false, socket_cb, nil)
+	mac.CFFileDescriptorEnableCallBacks(fdref, mac.kCFFileDescriptorReadCallBack)
+	mac.CFRunLoopAddSource(rl, mac.CFFileDescriptorCreateRunLoopSource(nil, fdref, 0), mac.kCFRunLoopDefaultMode)
+
+	// Global hotkeys via a CGEventTap. A keyboard tap needs Input Monitoring
+	// permission (distinct from Accessibility); prompt if we don't have it.
+	input_ok := bool(mac.CGPreflightListenEventAccess())
+	if !input_ok {
+		mac.CGRequestListenEventAccess() // shows the system prompt / adds us to the list
+	}
+	mask := mac.event_mask_bit(mac.kCGEventKeyDown) | mac.event_mask_bit(mac.kCGEventLeftMouseDown)
+	g_tap = mac.CGEventTapCreate(mac.kCGSessionEventTap, mac.kCGHeadInsertEventTap, mac.kCGEventTapOptionDefault, mask, tap_cb, nil)
+	if g_tap != nil {
+		mac.CFRunLoopAddSource(rl, mac.CFMachPortCreateRunLoopSource(nil, g_tap, 0), mac.kCFRunLoopDefaultMode)
+		mac.CGEventTapEnable(g_tap, true)
+	}
+
+	// Periodic reconcile (auto-track + auto-tile when live).
+	interval := f64(IDLE_MS) / 1000.0
+	timer := mac.CFRunLoopTimerCreate(nil, mac.CFAbsoluteTimeGetCurrent() + interval, interval, 0, 0, timer_cb, nil)
+	mac.CFRunLoopAddTimer(rl, timer, mac.kCFRunLoopDefaultMode)
+
+	// Faster tick: follow the OS focus (mouse clicks) and move the ring.
+	fi := f64(FOCUS_MS) / 1000.0
+	ftimer := mac.CFRunLoopTimerCreate(nil, mac.CFAbsoluteTimeGetCurrent() + fi, fi, 0, 0, focus_cb, nil)
+	mac.CFRunLoopAddTimer(rl, ftimer, mac.kCFRunLoopDefaultMode)
+
+	scope := manage_app == "" ? "all apps" : manage_app
+	fmt.printfln("niri-mac daemon listening on %s", SOCKET_PATH)
+	fmt.printfln("  managing %s, TILING (use `wm live off` or Alt+T to pause)", scope)
+	if g_tap != nil && input_ok {
+		fmt.println("  hotkeys: ENABLED (Alt+hjkl focus, r=width m=maximize g=grid/columns f=float ,/.=consume/expel Alt+Shift+,=group 1-9=focus, Ctrl+1-9=workspace, t=tiling; Cmd+Tab is native)")
+	} else {
+		fmt.println("  hotkeys: NOT ACTIVE — grant Input Monitoring to your terminal in")
+		fmt.println("           System Settings > Privacy & Security > Input Monitoring, then restart the daemon")
+	}
+
+	// Adopt and tile the current windows immediately, before entering the loop.
+	reconcile()
+	run_effector(nil)
+
+	// Run the AppKit event loop (not a bare CFRunLoopRun) so the settings window's
+	// controls receive mouse events; it still services our tap/socket/timers.
+	mac.wm_app_run()
+
+	mac.wm_bar_hide()
+	mac.wm_ring_hide()
+	restore_all() // put windows back where they were before exiting
+	ipc_cleanup()
+	clear_registry()
+	destroy_monitors()
+	delete(g.reg)
+	for k in g.ignore_apps do delete(k)
+	delete(g.ignore_apps)
+	fmt.println("daemon stopped")
+}
+
+// --- monitors ---------------------------------------------------------------
+
+// (Re)build g.monitors from the active displays: one Monitor per display, each
+// with its own bar strip + viewport and a fresh single-workspace strip, ordered
+// left→right by screen position so "next/prev monitor" navigation is spatial.
+@(private = "file")
+build_monitors :: proc() {
+	g.monitors = make([dynamic]Monitor)
+	g.menu_h = mac.wm_menu_bar_height() // reserve the top strip's clicks for the native menu bar
+
+	main := mac.CGMainDisplayID()
+	buf: [16]u32
+	for id in mac.active_displays(buf[:]) {
+		vf := mac.visible_frame(id)
+		full := layout.Rect{f64(vf.origin.x), f64(vf.origin.y), f64(vf.size.width), f64(vf.size.height)}
+
+		mon: Monitor
+		mon.display_id = id
+		mon.bar_rect = {full.x, full.y, full.w, BAR_H} // each display gets a bar across its top
+		mon.viewport = {full.x, full.y + BAR_H, full.w, full.h - BAR_H} // windows tile below it
+		mon.workspaces = make([dynamic]Workspace)
+		append(&mon.workspaces, Workspace{strip = layout.make_strip(GAP)})
+		append(&g.monitors, mon)
+	}
+
+	slice.sort_by(g.monitors[:], proc(a, b: Monitor) -> bool {return a.viewport.x < b.viewport.x})
+
+	g.focused_monitor = 0
+	for m, i in g.monitors do if m.display_id == main do g.focused_monitor = i
+}
+
+@(private = "file")
+destroy_monitors :: proc() {
+	for &mon in g.monitors {
+		for &w in mon.workspaces do layout.strip_destroy(&w.strip)
+		delete(mon.workspaces)
+	}
+	delete(g.monitors)
+	g.monitors = nil
+}
+
+// The monitor index whose display contains (px, py); falls back to the focused
+// monitor when the point isn't on any known display.
+@(private = "file")
+monitor_for_point :: proc(px, py: f64) -> int {
+	if disp, ok := mac.display_for_point(px, py); ok {
+		for m, i in g.monitors do if m.display_id == disp do return i
+	}
+	return g.focused_monitor
+}
+
+// --- run-loop callbacks (run on the main thread) ----------------------------
+
+@(private = "file")
+socket_cb :: proc "c" (f: mac.CFFileDescriptor, types: u64, info: rawptr) {
+	context = runtime.default_context()
+	stop := ipc_accept_once(g_listen_fd, daemon_handle)
+	if stop {
+		mac.wm_app_stop()
+		return
+	}
+	mac.CFFileDescriptorEnableCallBacks(f, mac.kCFFileDescriptorReadCallBack)
+}
+
+@(private = "file")
+timer_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
+	context = runtime.default_context()
+	// Display hotplug: if the number of active displays changed, rebuild the
+	// monitors and re-adopt windows from scratch so nothing is stranded on a
+	// monitor that no longer exists (which would otherwise be an out-of-range mon).
+	buf: [16]u32
+	if len(mac.active_displays(buf[:])) != len(g.monitors) {
+		full_resync()
+		if g.live do run_effector(nil)
+		mac.wm_bar_status_refresh()
+		return
+	}
+	added, removed := reconcile()
+	if g.live && (added > 0 || removed > 0) {
+		run_effector(nil)
+	}
+	mac.wm_bar_status_refresh() // keep the clock/battery/wifi cluster current
+	refresh_settings() // keep the open-window list live (no-op when closed)
+}
+
+// Fast tick: keep the focus ring on the daemon's focused window (also tracks the
+// window if it moves). NOTE: continuous OS-focus polling (click-to-focus) was
+// removed — it fought hotkey navigation because AX focus transfer isn't instant.
+// A click-detecting approach (mouse-down event tap) is the right way to re-add it.
+@(private = "file")
+focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
+	context = runtime.default_context()
+	if g_focus_hold > 0 {
+		// A hotkey just raised a window; let it settle before any click-sync, so
+		// a stale frontmost read can't snap focus back (the old polling bug).
+		g_focus_hold -= 1
+	} else if g_click_sync > 0 {
+		g_click_sync -= 1
+		if sync_focus_from_os() { // matched the clicked window into the strip
+			g_click_sync = 0
+			update_bar() // re-highlight the focused segment
+		}
+	} else {
+		// Follow the OS focus: native Cmd+Tab, Raycast, Spotlight, the Dock — any
+		// activation of a window we manage. Acts only when the frontmost window
+		// *changes* and isn't already our focus, so it never fights hotkey nav
+		// (which is further guarded by g_focus_hold above). This is what makes a
+		// "jump to a window" land even when we'd hidden it (other workspace / off
+		// view): run_effector un-hides and re-tiles it.
+		if id, ok := frontmost_managed(); ok && id != g_last_synced_id {
+			g_last_synced_id = id
+			if cur, has := layout.focused_window(cur_strip()); !has || cur != id {
+				focus_window_id(id)
+				run_effector(nil) // switch workspace / un-hide / re-tile
+				raise_focused() // re-assert focus after un-minimize
+				update_bar()
+			}
+		}
+	}
+	update_focus_ring()
+}
+
+@(private = "file")
+tap_cb :: proc "c" (proxy: mac.CGEventTapProxy, type: u32, event: mac.CGEvent, userInfo: rawptr) -> mac.CGEvent {
+	context = runtime.default_context()
+	if type == mac.kCGEventTapDisabledByTimeout || type == mac.kCGEventTapDisabledByUserInput {
+		if g_tap != nil do mac.CGEventTapEnable(g_tap, true)
+		return event
+	}
+	if type == mac.kCGEventKeyDown {
+		// We only inspect Alt-chords (our keymap) and Ctrl+digit (workspaces);
+		// other keys — including Cmd+Tab — pass straight through, never recorded.
+		flags := mac.CGEventGetFlags(event)
+		if (flags & mac.FLAG_ALT) != 0 || (flags & mac.FLAG_CONTROL) != 0 {
+			keycode := mac.CGEventGetIntegerValueField(event, mac.kCGKeyboardEventKeycode)
+			if dispatch_hotkey(keycode, flags) {
+				return mac.CGEvent(nil) // consume the keystroke
+			}
+		}
+	} else if type == mac.kCGEventLeftMouseDown {
+		loc := mac.CGEventGetLocation(event)
+		if bar_click(f64(loc.x), f64(loc.y)) {
+			return mac.CGEvent(nil) // consumed a click on the bar
+		}
+		// A real click on a window: follow the OS focus to it on the next fast
+		// ticks (the click isn't dispatched yet, so frontmost updates shortly).
+		g_click_sync = CLICK_SYNC_TICKS
+	}
+	return event
+}
+
+// Handle a left-click that landed on a status bar: focus the window whose segment
+// was clicked (on whichever monitor's bar it hit). Returns true if the click was
+// inside a bar (consume it).
+@(private = "file")
+bar_click :: proc(cx, cy: f64) -> bool {
+	main := mac.CGMainDisplayID()
+	for mon, mi in g.monitors {
+		r := mon.bar_rect
+		if !(cy >= r.y && cy < r.y + r.h && cx >= r.x && cx < r.x + r.w) do continue
+
+		id := mac.wm_bar_hit(c.int(mi), cx - r.x)
+
+		// Our own controls (gear, mode toggle) stay clickable even within the top
+		// menu-bar strip — they're the explicit exceptions to the pass-through.
+		switch id {
+		case mac.WM_BAR_SETTINGS:
+			mac.wm_settings_open()
+			refresh_settings()
+			return true
+		case mac.WM_BAR_MODE:
+			cycle_mode() // columns → monocle → grid → columns
+			return true
+		}
+
+		// On the main display only, let clicks in the native menu-bar strip fall
+		// through to the native menu bar (which reveals on hover over our bar).
+		if mon.display_id == main && cy < g.menu_h do return false
+
+		if id != mac.WM_BAR_NONE {
+			focus_window_id(layout.Window_Id(id))
+			run_effector(nil)
+			raise_focused()
+		}
+		return true // inside a bar (nothing tiled behind it) — consume
+	}
+	return false
+}
+
+// --- hotkeys ----------------------------------------------------------------
+
+@(private = "file")
+// Point the share stage at the currently focused window (live-mirror it). The
+// real window doesn't move; you share the "Niri Stage" window once in Teams and
+// swap sources with this. Needs Screen Recording permission (separate grant).
+stage_focused :: proc() {
+	if mac.wm_screen_capture_authorized() == 0 {
+		mac.wm_screen_capture_request()
+		fmt.println("grant Screen Recording to your terminal in System Settings > Privacy & Security > Screen Recording, then restart the daemon")
+		return
+	}
+	ax, ok := mac.focused_window()
+	if !ok do return
+	defer CF.Release(CF.TypeRef(ax))
+
+	wid: u32
+	if mac._AXUIElementGetWindow(ax, &wid) != .Success do return
+	mac.wm_stage_capture_window(wid)
+}
+
+dispatch_hotkey :: proc(keycode: i64, flags: u64) -> bool {
+	shift := (flags & mac.FLAG_SHIFT) != 0
+
+	// Alt+Ctrl+J/K: move the focused window to the next/prev monitor (and follow
+	// it). Checked before the Ctrl-digit block below, since this chord carries
+	// both Alt and Ctrl. J = next, K = prev.
+	if (flags & mac.FLAG_ALT) != 0 && (flags & mac.FLAG_CONTROL) != 0 {
+		if keycode == KEY_J || keycode == KEY_K {
+			move_focused_to_monitor(keycode == KEY_J ? 1 : -1)
+			run_effector(nil)
+			raise_focused()
+			return true
+		}
+		return false // other Alt+Ctrl chords pass through
+	}
+
+	// Workspaces: Ctrl+1..9 switch, Ctrl+Shift+1..9 move the focused window there.
+	// (Native Cmd+Tab is intentionally NOT intercepted — we follow it in focus_cb.)
+	if (flags & mac.FLAG_CONTROL) != 0 {
+		if n, is_digit := digit_for_keycode(keycode); is_digit {
+			if shift do ws_move_focused(n - 1) // 0-indexed workspaces
+			else do ws_switch(n - 1)
+			run_effector(nil)
+			raise_focused()
+			return true
+		}
+		return false // pass other Ctrl chords through to the OS
+	}
+
+	if (flags & mac.FLAG_ALT) == 0 do return false // our modifier is Alt
+
+	// Alt+S opens the settings window — handle it before the generic
+	// run_effector/raise_focused tail, which would steal focus back from it.
+	if keycode == KEY_S {
+		mac.wm_settings_open()
+		refresh_settings()
+		return true
+	}
+
+	// Alt+F floats/unfloats — self-contained (it raises the floated window itself,
+	// which the generic raise_focused tail would otherwise cover with a tile).
+	if keycode == KEY_F {
+		toggle_float_focused()
+		return true
+	}
+
+	// Alt+P mirrors the focused window onto the share stage — self-contained
+	// (no tile move/raise; the source window stays exactly where it is).
+	if keycode == KEY_P {
+		stage_focused()
+		return true
+	}
+
+	handled := true
+	switch keycode {
+	case KEY_H:
+		if shift do layout.move_column_left(cur_strip())
+		else do layout.focus_left(cur_strip())
+	case KEY_L:
+		if shift do layout.move_column_right(cur_strip())
+		else do layout.focus_right(cur_strip())
+	case KEY_J:
+		if shift do focus_monitor(1) // Alt+Shift+J: focus next monitor
+		else do layout.focus_down(cur_strip())
+	case KEY_K:
+		if shift do focus_monitor(-1) // Alt+Shift+K: focus prev monitor
+		else do layout.focus_up(cur_strip())
+	case KEY_R:
+		layout.cycle_width(cur_strip())
+	case KEY_M:
+		maximize_focused()
+	case KEY_Z:
+		toggle_monocle()
+	case KEY_G:
+		toggle_mode()
+	case KEY_COMMA:
+		if shift do group_with_app_mates() // Alt+Shift+, : dock with same-app windows
+		else do layout.consume_into_column(cur_strip())
+	case KEY_PERIOD:
+		layout.expel_from_column(cur_strip())
+	case KEY_T:
+		set_live(!g.live)
+	case:
+		if n, is_digit := digit_for_keycode(keycode); is_digit {
+			if shift do move_focused_to_slot(n)
+			else do focus_column(n)
+		} else {
+			handled = false
+		}
+	}
+
+	if handled {
+		run_effector(nil) // apply layout first (move the focused window into view)
+		raise_focused() // then give it real keyboard focus
+		fmt.printfln("hotkey keycode=%d shift=%v -> applied (live=%v)", keycode, shift, g.live)
+	}
+	return handled
+}
+
+@(private = "file")
+digit_for_keycode :: proc(kc: i64) -> (int, bool) {
+	switch kc {
+	case 18: return 1, true
+	case 19: return 2, true
+	case 20: return 3, true
+	case 21: return 4, true
+	case 23: return 5, true
+	case 22: return 6, true
+	case 26: return 7, true
+	case 28: return 8, true
+	case 25: return 9, true
+	}
+	return 0, false
+}
+
+// --- IPC handler ------------------------------------------------------------
+
+daemon_handle :: proc(cmd: string) -> (string, bool) {
+	b := strings.builder_make()
+	parts := strings.fields(cmd)
+	defer delete(parts)
+	op := len(parts) > 0 ? parts[0] : ""
+	stop := false
+
+	if op != "ping" && op != "quit" && op != "stop" && op != "sync" {
+		reconcile()
+	}
+
+	switch op {
+	case "ping":
+		fmt.sbprintln(&b, "pong")
+	case "quit", "stop":
+		fmt.sbprintln(&b, "stopping daemon")
+		stop = true
+	case "sync":
+		full_resync()
+		fmt.sbprintfln(&b, "resynced: %d window(s)", len(g.reg))
+		render_state(&b)
+	case "state":
+		render_state(&b)
+	case "focus-left":
+		layout.focus_left(cur_strip());render_state(&b);raise_focused()
+	case "focus-right":
+		layout.focus_right(cur_strip());render_state(&b);raise_focused()
+	case "focus-up":
+		layout.focus_up(cur_strip());render_state(&b);raise_focused()
+	case "focus-down":
+		layout.focus_down(cur_strip());render_state(&b);raise_focused()
+	case "move-left":
+		layout.move_column_left(cur_strip());render_state(&b)
+	case "move-right":
+		layout.move_column_right(cur_strip());render_state(&b)
+	case "width":
+		layout.cycle_width(cur_strip());render_state(&b)
+	case "width-max":
+		maximize_focused();render_state(&b)
+	case "consume":
+		layout.consume_into_column(cur_strip());render_state(&b)
+	case "expel":
+		layout.expel_from_column(cur_strip());render_state(&b)
+	case "focus-monitor":
+		dir := len(parts) > 1 && parts[1] == "prev" ? -1 : 1
+		focus_monitor(dir);render_state(&b);raise_focused()
+	case "move-to-monitor":
+		dir := len(parts) > 1 && parts[1] == "prev" ? -1 : 1
+		move_focused_to_monitor(dir);render_state(&b);raise_focused()
+	case "windows":
+		// Machine-readable list of tiled windows: id <TAB> mon <TAB> ws <TAB> app <TAB> title.
+		// Feed a fuzzy picker (Raycast) and jump with `focus-window <id>`.
+		for mon, mi in g.monitors {
+			for wi in 0 ..< len(mon.workspaces) {
+				s := &mon.workspaces[wi].strip
+				for ci in 0 ..< len(s.columns) {
+					for tile in s.columns[ci].tiles {
+						if m, ok := g.reg[tile.id]; ok {
+							fmt.sbprintfln(&b, "%d\t%d\t%d\t%s\t%s", u64(tile.id), mi + 1, wi + 1, m.app, m.title)
+						}
+					}
+				}
+			}
+		}
+	case "focus-window":
+		if len(parts) > 1 {
+			if v, ok := strconv.parse_u64(parts[1]); ok {
+				focus_window_id(layout.Window_Id(v))
+				run_effector(nil)
+				raise_focused()
+				render_state(&b)
+			} else {
+				fmt.sbprintln(&b, "usage: focus-window <id>")
+			}
+		} else {
+			fmt.sbprintln(&b, "usage: focus-window <id>")
+		}
+	case "workspace":
+		if n, ok := parse_ws(parts); ok {
+			ws_switch(n)
+			fmt.sbprintfln(&b, "switched to workspace %d", n)
+			render_state(&b)
+		} else {
+			fmt.sbprintln(&b, "usage: workspace <n>")
+		}
+	case "move-to-workspace":
+		if n, ok := parse_ws(parts); ok {
+			ws_move_focused(n)
+			fmt.sbprintfln(&b, "moved focused window to workspace %d", n)
+			render_state(&b)
+		} else {
+			fmt.sbprintln(&b, "usage: move-to-workspace <n>")
+		}
+	case "live":
+		if len(parts) > 1 && parts[1] == "on" {
+			set_live(true)
+		} else if len(parts) > 1 && parts[1] == "off" {
+			set_live(false)
+		}
+		fmt.sbprintfln(&b, "effector: %s", g.live ? "LIVE" : "dry-run")
+		render_state(&b)
+	case "mode":
+		if len(parts) > 1 && parts[1] == "columns" {
+			g.mode = .Columns
+		} else if len(parts) > 1 && parts[1] == "grid" {
+			g.mode = .Grid
+		} else if len(parts) > 1 && (parts[1] == "monocle" || parts[1] == "fullscreen") {
+			g.mode = .Monocle
+		} else {
+			cycle_mode()
+		}
+		fmt.sbprintfln(&b, "layout: %s", mode_name(g.mode))
+		render_state(&b)
+	case "hide-mode":
+		if len(parts) > 1 && (parts[1] == "offscreen" || parts[1] == "minimize") {
+			restore_all() // clear windows out of the old mode first
+			g.hide_offscreen = parts[1] == "offscreen"
+		}
+		fmt.sbprintfln(&b, "hide mode: %s", g.hide_offscreen ? "offscreen (no animation)" : "minimize")
+		render_state(&b)
+	case "settings":
+		mac.wm_settings_open()
+		refresh_settings()
+		fmt.sbprintln(&b, "opened settings window")
+	case "stage":
+		stage_focused()
+		fmt.sbprintln(&b, "mirroring focused window to the share stage")
+	case "stage-hide":
+		mac.wm_stage_hide()
+		fmt.sbprintln(&b, "hid the share stage")
+	case "float":
+		toggle_float_focused()
+		render_state(&b)
+	case "ignore":
+		if len(parts) > 1 {
+			app := strings.join(parts[1:], " ")
+			defer delete(app)
+			ignore_app(app)
+			fmt.sbprintfln(&b, "ignoring %q — its windows now float", app)
+		} else {
+			fmt.sbprintln(&b, "usage: ignore <App name>")
+		}
+		render_state(&b)
+	case "unignore":
+		if len(parts) > 1 {
+			app := strings.join(parts[1:], " ")
+			defer delete(app)
+			unignore_app(app)
+			fmt.sbprintfln(&b, "no longer ignoring %q", app)
+		} else {
+			fmt.sbprintln(&b, "usage: unignore <App name>")
+		}
+		render_state(&b)
+	case:
+		fmt.sbprintfln(&b, "unknown command: %q", cmd)
+	}
+
+	return strings.to_string(b), stop
+}
+
+@(private = "file")
+parse_ws :: proc(parts: []string) -> (int, bool) {
+	if len(parts) < 2 do return 0, false
+	n, ok := strconv.parse_int(parts[1])
+	if !ok || n < 1 do return 0, false
+	return n - 1, true // user-facing 1-indexed -> internal 0-indexed
+}
+
+// --- workspaces -------------------------------------------------------------
+
+@(private = "file")
+cur_mon :: proc() -> ^Monitor {
+	return &g.monitors[g.focused_monitor]
+}
+
+@(private = "file")
+cur_strip :: proc() -> ^layout.Strip {
+	m := cur_mon()
+	return &m.workspaces[m.focused_ws].strip
+}
+
+// The strip a managed window lives on (its monitor's workspace), if both indices
+// are still in range (a removed monitor can leave a window's mon dangling).
+@(private = "file")
+strip_of :: proc(m: Managed) -> (^layout.Strip, bool) {
+	if m.mon < 0 || m.mon >= len(g.monitors) do return nil, false
+	mon := &g.monitors[m.mon]
+	if m.ws < 0 || m.ws >= len(mon.workspaces) do return nil, false
+	return &mon.workspaces[m.ws].strip, true
+}
+
+@(private = "file")
+ensure_ws :: proc(n: int) {
+	m := cur_mon()
+	for len(m.workspaces) <= n {
+		append(&m.workspaces, Workspace{strip = layout.make_strip(GAP)})
+	}
+}
+
+// Focus the next (+1) / previous (-1) monitor, wrapping. Its own focused window
+// becomes the focus; the caller re-tiles + raises.
+@(private = "file")
+focus_monitor :: proc(dir: int) {
+	if len(g.monitors) < 2 do return
+	g.focused_monitor = (g.focused_monitor + dir + len(g.monitors)) % len(g.monitors)
+}
+
+// Move the focused window to the next (+1) / previous (-1) monitor's focused
+// workspace and follow it there. The effector re-tiles it into that monitor's
+// viewport (no manual remap needed for a tiled window).
+@(private = "file")
+move_focused_to_monitor :: proc(dir: int) {
+	if len(g.monitors) < 2 do return
+	s := cur_strip()
+	id, has := layout.focused_window(s)
+	if !has do return
+	m, ok := g.reg[id]
+	if !ok do return
+
+	target := (g.focused_monitor + dir + len(g.monitors)) % len(g.monitors)
+	layout.remove_window(s, id)
+
+	tmon := &g.monitors[target]
+	layout.add_window(&tmon.workspaces[tmon.focused_ws].strip, id)
+	m.mon = target
+	m.ws = tmon.focused_ws
+	g.reg[id] = m
+	g.focused_monitor = target // focus follows the window
+}
+
+// Focus the n-th window/column (1-based) in the current workspace.
+@(private = "file")
+focus_column :: proc(n: int) {
+	s := cur_strip()
+	idx := n - 1
+	if idx >= 0 && idx < len(s.columns) do s.focused_col = idx
+}
+
+// Give the daemon's focused window real keyboard focus (raise + activate app).
+@(private = "file")
+raise_focused :: proc() {
+	id, ok := layout.focused_window(cur_strip())
+	if !ok do return
+	m, found := g.reg[id]
+	if found {
+		mac.focus_window(m.ax, m.pid)
+		g_focus_hold = FOCUS_HOLD_TICKS // hold off OS-focus polling while this settles
+		g_last_synced_id = id // our own focus, not an external change to follow
+	}
+}
+
+// Point the daemon's focus at the window the user actually has focused in the OS
+// (e.g. after a mouse click). Returns false if that window isn't one we manage.
+@(private = "file")
+sync_focus_from_os :: proc() -> bool {
+	w, ok := mac.focused_window()
+	if !ok do return false
+	defer CF.Release(CF.TypeRef(w))
+	for id, m in g.reg {
+		if bool(mac.CFEqual(CF.TypeRef(m.ax), CF.TypeRef(w))) {
+			focus_window_id(id)
+			return true
+		}
+	}
+	return false
+}
+
+@(private = "file")
+focus_window_id :: proc(id: layout.Window_Id) {
+	for mi in 0 ..< len(g.monitors) {
+		mon := &g.monitors[mi]
+		for wi in 0 ..< len(mon.workspaces) {
+			s := &mon.workspaces[wi].strip
+			for ci in 0 ..< len(s.columns) {
+				for ti in 0 ..< len(s.columns[ci].tiles) {
+					if s.columns[ci].tiles[ti].id == id {
+						g.focused_monitor = mi
+						mon.focused_ws = wi
+						s.focused_col = ci
+						s.columns[ci].focused_tile = ti
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+// Dock the focused window into the nearest column (searching outward from the
+// focused column) that already holds another window of the same app — e.g. a
+// torn-off browser window rejoining its siblings. No-op if there's no such column.
+// Mutates only; the caller applies the layout (run_effector/raise).
+@(private = "file")
+group_with_app_mates :: proc() {
+	s := cur_strip()
+	id, ok := layout.focused_window(s)
+	if !ok do return
+	me, found := g.reg[id]
+	if !found do return
+
+	best, bestd := -1, max(int)
+	for ci in 0 ..< len(s.columns) {
+		if ci == s.focused_col do continue
+		for tile in s.columns[ci].tiles {
+			m, ok2 := g.reg[tile.id]
+			if !ok2 || m.app != me.app do continue
+			if d := abs(ci - s.focused_col); d < bestd {
+				bestd, best = d, ci
+			}
+			break // this column qualifies; move on to the next
+		}
+	}
+	if best >= 0 do layout.regroup_into(s, id, best)
+}
+
+// Move the focused column to slot n (1-based), reordering the strip.
+@(private = "file")
+move_focused_to_slot :: proc(n: int) {
+	s := cur_strip()
+	if len(s.columns) == 0 do return
+	target := clamp(n - 1, 0, len(s.columns) - 1)
+	for s.focused_col > target do layout.move_column_left(s)
+	for s.focused_col < target do layout.move_column_right(s)
+}
+
+// Switch the layout between the scrollable column strip and a grid.
+@(private = "file")
+toggle_mode :: proc() {
+	g.mode = g.mode == .Grid ? .Columns : .Grid
+	run_effector(nil)
+}
+
+// Toggle fullscreen/monocle (one window per screen) on and off; "off" is the
+// normal scrollable columns. Non-destructive — column widths are preserved.
+@(private = "file")
+toggle_monocle :: proc() {
+	g.mode = g.mode == .Monocle ? .Columns : .Monocle
+	run_effector(nil)
+}
+
+// Advance the layout mode columns → monocle → grid → columns. Driven by the
+// single bar mode control so one click can reach every mode.
+@(private = "file")
+cycle_mode :: proc() {
+	switch g.mode {
+	case .Columns: g.mode = .Monocle
+	case .Monocle: g.mode = .Grid
+	case .Grid:    g.mode = .Columns
+	}
+	run_effector(nil)
+}
+
+@(private = "file")
+mode_name :: proc(m: Layout_Mode) -> string {
+	switch m {
+	case .Grid:    return "grid"
+	case .Monocle: return "monocle"
+	case .Columns: return "columns"
+	}
+	return "columns"
+}
+
+// The managed window the user currently sees as frontmost (so a floated window,
+// which isn't in the strip, can still be the Alt+F target to un-float it).
+@(private = "file")
+frontmost_managed :: proc() -> (layout.Window_Id, bool) {
+	w, ok := mac.focused_window()
+	if !ok do return 0, false
+	defer CF.Release(CF.TypeRef(w))
+	for id, m in g.reg {
+		if bool(mac.CFEqual(CF.TypeRef(m.ax), CF.TypeRef(w))) do return id, true
+	}
+	return 0, false
+}
+
+// A rect covering `frac` of the viewport, centred in it.
+@(private = "file")
+centered_rect :: proc(vp: layout.Rect, frac: f64) -> layout.Rect {
+	w := vp.w * frac
+	h := vp.h * frac
+	return {vp.x + (vp.w - w) / 2, vp.y + (vp.h - h) / 2, w, h}
+}
+
+// Toggle a window between tiled and floating. Floating pops it out of the strip,
+// centres it, and raises it so it's a free, draggable window the daemon no longer
+// touches; un-floating re-tiles it. The target is the OS-frontmost managed window
+// (falling back to the strip focus), so a floated window can be un-floated by
+// clicking/raising it and pressing Alt+F again.
+@(private = "file")
+toggle_float_focused :: proc() {
+	id, ok := frontmost_managed()
+	if !ok {
+		id, ok = layout.focused_window(cur_strip())
+	}
+	if !ok do return
+	m, in_reg := g.reg[id]
+	if !in_reg do return
+
+	if m.floated {
+		// Un-float: back into the strip and re-tiled.
+		m.floated = false
+		g.reg[id] = m
+		layout.append_window(cur_strip(), id)
+		run_effector(nil)
+		raise_focused()
+	} else {
+		// Float: pop out, re-tile the rest, then centre + raise this one.
+		m.floated = true
+		g.reg[id] = m
+		layout.remove_window(cur_strip(), id)
+		run_effector(nil)
+		if m.hidden {
+			mac.ax_set_minimized(m.ax, false)
+			set_hidden(id, false)
+		}
+		mac.set_frame(m.ax, to_cg(centered_rect(cur_mon().viewport, 0.6)))
+		mac.focus_window(m.ax, m.pid) // raise + focus so it's draggable immediately
+	}
+}
+
+// Add an app (by CGWindow owner name) to the never-tile set and evict any of its
+// windows currently in the strip (they stay where they are, now floating).
+@(private = "file")
+ignore_app :: proc(app: string) {
+	if app == "" || app in g.ignore_apps do return
+	g.ignore_apps[strings.clone(app)] = true
+
+	evict: [dynamic]layout.Window_Id
+	defer delete(evict)
+	for id, m in g.reg do if m.app == app do append(&evict, id)
+	for id in evict {
+		m := g.reg[id]
+		if s, ok := strip_of(m); ok do layout.remove_window(s, id)
+		CF.Release(CF.TypeRef(m.ax))
+		delete(m.title)
+		delete(m.app)
+		delete_key(&g.reg, id)
+	}
+	run_effector(nil)
+}
+
+// Remove an app from the never-tile set; reconcile re-adopts its windows.
+@(private = "file")
+unignore_app :: proc(app: string) {
+	key: string
+	found := false
+	for k in g.ignore_apps {
+		if k == app {
+			key = k
+			found = true
+			break
+		}
+	}
+	if !found do return
+	delete_key(&g.ignore_apps, key)
+	delete(key)
+	reconcile()
+	run_effector(nil)
+}
+
+// Toggle the focused column between full width and the default width.
+@(private = "file")
+maximize_focused :: proc() {
+	s := cur_strip()
+	if len(s.columns) == 0 do return
+	col := &s.columns[s.focused_col]
+	col.width_frac = col.width_frac >= 0.99 ? layout.DEFAULT_WIDTH : 1.0
+	col.eff_w = 0 // re-probe at the new width
+}
+
+@(private = "file")
+ws_switch :: proc(n: int) {
+	ensure_ws(n)
+	cur_mon().focused_ws = n
+}
+
+@(private = "file")
+ws_move_focused :: proc(n: int) {
+	id, has := layout.focused_window(cur_strip())
+	if !has do return
+	ensure_ws(n)
+	layout.remove_window(cur_strip(), id)
+	mon := cur_mon()
+	layout.add_window(&mon.workspaces[n].strip, id)
+	m := g.reg[id]
+	m.ws = n
+	g.reg[id] = m
+}
+
+// --- window tracking --------------------------------------------------------
+
+@(private = "file")
+clear_registry :: proc() {
+	for _, m in g.reg {
+		CF.Release(CF.TypeRef(m.ax))
+		delete(m.title)
+		delete(m.app)
+	}
+	clear(&g.reg)
+}
+
+@(private = "file")
+full_resync :: proc() {
+	clear_registry()
+	destroy_monitors()
+	build_monitors() // re-read displays too, so this doubles as hotplug handling
+	reconcile()
+}
+
+// Whether a freshly-seen window should be adopted into the tiling strip. Skips
+// user-ignored apps, windows too small to be anything but a popup, and
+// fixed-size windows (alerts/notifications can't be resized to fit a column).
+@(private = "file")
+should_tile :: proc(w: mac.Std_Window) -> bool {
+	if w.app in g.ignore_apps do return false
+	if f64(w.frame.size.width) < MIN_TILE_W || f64(w.frame.size.height) < MIN_TILE_H do return false
+	if !mac.ax_settable(w.ax, "AXSize") do return false
+	return true
+}
+
+@(private = "file")
+reconcile :: proc() -> (added: int, removed: int) {
+	wins := mac.standard_windows(g.manage_app)
+	defer delete(wins)
+
+	matched := make([]bool, len(wins))
+	defer delete(matched)
+
+	to_remove: [dynamic]layout.Window_Id
+	defer delete(to_remove)
+	for id, m in g.reg {
+		found := false
+		for w, i in wins {
+			if matched[i] do continue
+			if bool(mac.CFEqual(CF.TypeRef(m.ax), CF.TypeRef(w.ax))) {
+				matched[i] = true
+				found = true
+				break
+			}
+		}
+		// A window we minimized drops out of the on-screen enumeration; don't
+		// mistake that for the user closing it.
+		if !found && !m.hidden do append(&to_remove, id)
+	}
+	for id in to_remove {
+		m := g.reg[id]
+		if s, ok := strip_of(m); ok do layout.remove_window(s, id)
+		CF.Release(CF.TypeRef(m.ax))
+		delete(m.title)
+		delete(m.app)
+		delete_key(&g.reg, id)
+		removed += 1
+	}
+
+	// Append new windows in reverse z-order so the strip reads oldest->newest
+	// (left->right) instead of frontmost-first; the newest ends up focused.
+	#reverse for w, i in wins {
+		if matched[i] {
+			mac.std_window_destroy(w)
+			continue
+		}
+		// Leave alerts, notification popups, and user-ignored apps floating.
+		if !should_tile(w) {
+			mac.std_window_destroy(w)
+			continue
+		}
+		// Home the window on the monitor its frame currently sits on, in that
+		// monitor's focused workspace.
+		cx, cy := layout.center_of(to_rect(w.frame))
+		mi := monitor_for_point(cx, cy)
+		mon := &g.monitors[mi]
+
+		id := layout.Window_Id(g.next_id)
+		g.next_id += 1
+		g.reg[id] = Managed {
+			pid   = w.pid,
+			ax    = w.ax,
+			title = w.title,
+			app   = w.app,
+			mon   = mi,
+			ws    = mon.focused_ws,
+			orig  = to_rect(w.frame),
+		}
+		layout.append_window(&mon.workspaces[mon.focused_ws].strip, id) // new windows land on the right
+		added += 1
+	}
+	return
+}
+
+// --- rendering / effector ---------------------------------------------------
+
+@(private = "file")
+render_state :: proc(b: ^strings.Builder) {
+	fmt.sbprintfln(b, "monitor %d/%d  (effector=%s)", g.focused_monitor + 1, len(g.monitors), g.live ? "LIVE" : "dry-run")
+
+	for mon, mi in g.monitors {
+		s := &mon.workspaces[mon.focused_ws].strip
+		marker := mi == g.focused_monitor ? "*" : " "
+		fmt.sbprintfln(b, "%smonitor %d (display %d, ws %d/%d):", marker, mi + 1, mon.display_id, mon.focused_ws, len(mon.workspaces) - 1)
+		if len(s.columns) == 0 do fmt.sbprintln(b, "  (focused workspace empty)")
+		for col, ci in s.columns {
+			fmt.sbprintf(b, ci == s.focused_col ? "  > col%d w=%.2f:" : "    col%d w=%.2f:", ci, col.width_frac)
+			for tile, ti in col.tiles {
+				star := ci == s.focused_col && ti == col.focused_tile ? "*" : ""
+				fmt.sbprintf(b, " [%d %s%s]", u64(tile.id), short(g.reg[tile.id].title), star)
+			}
+			fmt.sbprintln(b)
+		}
+	}
+
+	run_effector(b)
+
+	for mon, mi in g.monitors {
+		for ws, wi in mon.workspaces {
+			if wi == mon.focused_ws do continue
+			n := 0
+			for col in ws.strip.columns do n += len(col.tiles)
+			if n > 0 do fmt.sbprintfln(b, "  monitor %d workspace %d: %d window(s) hidden", mi + 1, wi, n)
+		}
+	}
+
+	nfloat := 0
+	for _, m in g.reg do if m.floated do nfloat += 1
+	if nfloat > 0 do fmt.sbprintfln(b, "  floating (Alt+F, not tiled): %d window(s)", nfloat)
+	if len(g.ignore_apps) > 0 {
+		fmt.sbprint(b, "  ignored apps:")
+		for k in g.ignore_apps do fmt.sbprintf(b, " %q", k)
+		fmt.sbprintln(b)
+	}
+}
+
+// Tile every monitor (each into its own viewport), then refresh the ring + bar.
+// All monitors are always laid out; only the focused workspace of each shows.
+@(private = "file")
+run_effector :: proc(b: ^strings.Builder) {
+	for mi in 0 ..< len(g.monitors) do apply_monitor(b, mi)
+	update_focus_ring()
+	update_bar()
+}
+
+// Apply the focused workspace of monitor `mi` into that monitor's viewport, and
+// hide its other workspaces.
+@(private = "file")
+apply_monitor :: proc(b: ^strings.Builder, mi: int) {
+	mon := &g.monitors[mi]
+	s := &mon.workspaces[mon.focused_ws].strip
+	if g.live && g.mode == .Columns do learn_widths(s)
+	ps: []layout.Placement
+	switch g.mode {
+	case .Grid:    ps = layout.compute_grid(s, mon.viewport)
+	case .Monocle: ps = layout.compute_monocle(s, mon.viewport)
+	case .Columns: ps = layout.compute_layout(s, mon.viewport)
+	}
+	defer delete(ps)
+
+	if b != nil do fmt.sbprintfln(b, "monitor %d (display %d) view_x=%.0f", mi + 1, mon.display_id, s.view_x)
+	for p in ps {
+		m := g.reg[p.id]
+		applied := ""
+		if g.live {
+			if p.visible {
+				if m.hidden {
+					mac.ax_set_minimized(m.ax, false)
+					set_hidden(p.id, false)
+				}
+				mac.set_frame(m.ax, to_cg(p.rect))
+				set_req_w(p.id, p.rect.w) // remember the asked-for width to detect clamping next tick
+				applied = " -> on-screen"
+			} else {
+				// Hide off-view columns. Either park off-screen (instant, no genie
+				// animation) or minimize. Mark hidden so reconcile doesn't mistake
+				// the vanished-from-enumeration window for a closed one.
+				if g.hide_offscreen {
+					mac.set_frame(m.ax, to_cg(hidden_rect(p.rect, p.side, mon.viewport)), size_first = true)
+				} else {
+					mac.ax_set_minimized(m.ax, true)
+				}
+				set_hidden(p.id, true)
+				applied = g.hide_offscreen ? " -> off-screen" : " -> minimized"
+			}
+		}
+		if b != nil {
+			fmt.sbprintfln(
+				b,
+				"  win %d %-20s (%.0f,%.0f %.0fx%.0f) %s%s",
+				u64(p.id), short(m.title),
+				p.rect.x, p.rect.y, p.rect.w, p.rect.h,
+				p.visible ? "visible" : "HIDDEN", applied,
+			)
+		}
+	}
+
+	if g.live {
+		for ws, wi in mon.workspaces {
+			if wi == mon.focused_ws do continue
+			for col in ws.strip.columns {
+				for tile in col.tiles {
+					mac.ax_set_minimized(g.reg[tile.id].ax, true)
+					set_hidden(tile.id, true)
+				}
+			}
+		}
+	}
+}
+
+// Refresh every monitor's bar (one per display), then hide any bars left over
+// from a display that was unplugged, and push the clock/battery/wifi cluster.
+@(private = "file")
+update_bar :: proc() {
+	for mi in 0 ..< len(g.monitors) do set_monitor_bar(mi)
+	mac.wm_bar_hide_from(c.int(len(g.monitors))) // drop bars for displays that went away
+	mac.wm_bar_status_refresh() // clock/battery/wifi on the right of each bar
+}
+
+// Build and push monitor `mi`'s bar: settings gear, this monitor's status (with a
+// dot marking the focused monitor), the mode toggle, then one clickable segment
+// per window on its focused workspace (the focused one highlighted) — so each
+// display's bar shows exactly which windows live on it.
+@(private = "file")
+set_monitor_bar :: proc(mi: int) {
+	mon := &g.monitors[mi]
+	s := &mon.workspaces[mon.focused_ws].strip
+
+	segs: [dynamic]mac.WMBarSeg
+	defer delete(segs)
+	cstrs: [dynamic]cstring
+	defer {
+		for cs in cstrs do delete(cs)
+		delete(cstrs)
+	}
+
+	// Settings gear (leftmost, clickable — opens the settings window). Rendered as
+	// an SF Symbol by the bar view, so no text is needed here.
+	append(&segs, mac.WMBarSeg{app = nil, window_id = mac.WM_BAR_SETTINGS})
+
+	// Status segment (non-clickable): this monitor + its workspace; a leading dot
+	// marks the monitor that currently has focus.
+	status: string
+	if len(g.monitors) > 1 {
+		dot := mi == g.focused_monitor ? "● " : ""
+		status = fmt.aprintf("%smon %d/%d · ws %d/%d", dot, mi + 1, len(g.monitors), mon.focused_ws + 1, len(mon.workspaces))
+	} else {
+		status = fmt.aprintf("ws %d/%d", mon.focused_ws + 1, len(mon.workspaces))
+	}
+	status_c := strings.clone_to_cstring(status)
+	delete(status)
+	mode_c := strings.clone_to_cstring(g.live ? "tiling" : "dry-run")
+	append(&cstrs, status_c, mode_c)
+	append(&segs, mac.WMBarSeg{app = status_c, title = mode_c, window_id = mac.WM_BAR_NONE})
+
+	// Clickable layout-mode toggle. The plain word picks the SF Symbol in the view.
+	layout_c := strings.clone_to_cstring(mode_name(g.mode))
+	append(&cstrs, layout_c)
+	append(&segs, mac.WMBarSeg{app = layout_c, window_id = mac.WM_BAR_MODE})
+
+	// One clickable segment per window on this monitor.
+	for col, ci in s.columns {
+		for tile, ti in col.tiles {
+			m := g.reg[tile.id]
+			app_c := strings.clone_to_cstring(clip(m.app, 18))
+			title_c := strings.clone_to_cstring(clip(m.title, 26))
+			append(&cstrs, app_c, title_c)
+			foc: c.int = (ci == s.focused_col && ti == col.focused_tile) ? 1 : 0
+			append(&segs, mac.WMBarSeg {
+				app       = app_c,
+				title     = title_c,
+				window_id = u64(tile.id),
+				focused   = foc,
+				index     = c.int(ci + 1), // column number = Alt+<n>
+			})
+		}
+	}
+
+	mac.wm_bar_set(c.int(mi), raw_data(segs[:]), c.int(len(segs)), mon.bar_rect.x, mon.bar_rect.y, mon.bar_rect.w, mon.bar_rect.h)
+}
+
+// --- settings window --------------------------------------------------------
+
+// A button in the settings window was clicked; run it as a daemon command, then
+// re-push the window's contents. Runs on the main thread (same as the daemon),
+// so touching daemon state directly is safe.
+@(private = "file")
+settings_cmd_cb :: proc "c" (cmd: cstring) {
+	context = runtime.default_context()
+	c := string(cmd)
+	switch c {
+	case "live toggle":
+		set_live(!g.live)
+	case "mode toggle":
+		toggle_mode()
+	case "monocle toggle":
+		toggle_monocle()
+	case "hide-mode toggle":
+		restore_all()
+		g.hide_offscreen = !g.hide_offscreen
+		run_effector(nil)
+	case:
+		reply, _ := daemon_handle(c) // ignore / unignore <App>
+		delete(reply)
+	}
+	refresh_settings()
+}
+
+// Push current config, the hotkey reference, and the full open-window list (with
+// per-app ignore state) into the settings window. No-op while it's closed.
+@(private = "file")
+refresh_settings :: proc() {
+	if mac.wm_settings_is_open() == 0 do return
+
+	wins := mac.standard_windows("")
+	defer {
+		for w in wins do mac.std_window_destroy(w)
+		delete(wins)
+	}
+	rows: [dynamic]mac.WMSettingsRow
+	cstrs: [dynamic]cstring
+	defer {
+		for cs in cstrs do delete(cs)
+		delete(cstrs)
+		delete(rows)
+	}
+	for w in wins {
+		app_c := strings.clone_to_cstring(w.app)
+		title_c := strings.clone_to_cstring(w.title)
+		append(&cstrs, app_c, title_c)
+		ign: c.int = (w.app in g.ignore_apps) ? 1 : 0
+		append(&rows, mac.WMSettingsRow{app = app_c, title = title_c, ignored = ign})
+	}
+	mac.wm_settings_set_rows(raw_data(rows[:]), c.int(len(rows)))
+
+	cfg := fmt.aprintf(
+		"Tiling: %s      Layout: %s      Hide: %s      Gap: %dpx",
+		g.live ? "on" : "paused (dry-run)",
+		mode_name(g.mode),
+		g.hide_offscreen ? "off-screen" : "minimize",
+		int(GAP),
+	)
+	defer delete(cfg)
+	cfg_c := strings.clone_to_cstring(cfg)
+	defer delete(cfg_c)
+	hk_c := strings.clone_to_cstring(HOTKEYS_TEXT)
+	defer delete(hk_c)
+	mac.wm_settings_set_info(cfg_c, hk_c)
+}
+
+// Truncate to at most n bytes without splitting a UTF-8 sequence (empty stays
+// empty so the bar omits a missing title).
+@(private = "file")
+clip :: proc(s: string, n: int) -> string {
+	if len(s) <= n do return s
+	i := n
+	for i > 0 && (s[i] & 0xC0) == 0x80 do i -= 1
+	return s[:i]
+}
+
+// Draw the focus ring around the focused window's *actual* current frame, so it
+// gives visible feedback even in dry-run (where windows aren't moved).
+@(private = "file")
+update_focus_ring :: proc() {
+	fid, has := layout.focused_window(cur_strip())
+	if !has {
+		mac.wm_ring_hide()
+		return
+	}
+	m, ok := g.reg[fid]
+	if !ok {
+		mac.wm_ring_hide()
+		return
+	}
+	pos, p_ok := mac.ax_point(m.ax, "AXPosition")
+	sz, s_ok := mac.ax_size(m.ax, "AXSize")
+	if p_ok && s_ok {
+		mac.wm_ring_show(f64(pos.x), f64(pos.y), f64(sz.width), f64(sz.height))
+	} else {
+		mac.wm_ring_hide()
+	}
+}
+
+EDGE_REVEAL :: 6.0
+
+// Where to park an off-view window: push it down past its OWN monitor's bottom
+// edge, leaving EDGE_REVEAL px peeking. Keeping part on-screen means macOS won't
+// clamp it and it stays in the window list (no eviction) — how Hiro/OmniWM hides.
+//
+// Parking *down* (not left/right) is what keeps it off the neighbouring monitor:
+// sliding a window off the left/right edge slides it straight onto a
+// horizontally-adjacent display. x stays within this monitor, so the only place
+// it can peek is this monitor's own bottom — invisible to the other screen.
+// (Assumes a horizontal display arrangement, the common case; a display stacked
+// directly below would still see the peek.)
+@(private = "file")
+hidden_rect :: proc(r: layout.Rect, side: layout.Hide_Side, v: layout.Rect) -> layout.Rect {
+	return {r.x, v.y + v.h - EDGE_REVEAL, r.w, r.h}
+}
+
+// Restore every managed window to the frame it had when first managed, so
+// un-tiling (or stopping the daemon) puts windows back where they were.
+@(private = "file")
+restore_all :: proc() {
+	ids: [dynamic]layout.Window_Id
+	defer delete(ids)
+	for id, m in g.reg {
+		mac.ax_set_minimized(m.ax, false)
+		mac.set_frame(m.ax, to_cg(m.orig))
+		append(&ids, id)
+	}
+	for id in ids do set_hidden(id, false)
+}
+
+// Toggle the effector. Turning it off restores all managed windows.
+@(private = "file")
+set_live :: proc(on: bool) {
+	if g.live && !on do restore_all()
+	g.live = on
+}
+
+@(private = "file")
+set_hidden :: proc(id: layout.Window_Id, hidden: bool) {
+	m, ok := g.reg[id]
+	if ok && m.hidden != hidden {
+		m.hidden = hidden
+		g.reg[id] = m
+	}
+}
+
+@(private = "file")
+set_req_w :: proc(id: layout.Window_Id, w: f64) {
+	m, ok := g.reg[id]
+	if ok {
+		m.req_w = w
+		g.reg[id] = m
+	}
+}
+
+// Detect width-constrained windows (those that won't grow to the width we asked
+// for, e.g. System Settings) and record their real width as the column's eff_w,
+// so compute_layout packs neighbours against it instead of the nominal slot.
+@(private = "file")
+learn_widths :: proc(s: ^layout.Strip) {
+	for &col in s.columns {
+		if len(col.tiles) == 0 do continue
+		id := col.tiles[col.focused_tile].id
+		m, ok := g.reg[id]
+		if !ok || m.hidden || m.req_w <= 0 do continue // only on-screen, already-asked windows
+		sz, got := mac.ax_size(m.ax, "AXSize")
+		if !got do continue
+		actual := f64(sz.width)
+		if actual < m.req_w - WIDTH_TOL {
+			col.eff_w = actual // clamped narrower than asked → pack against the real width
+		}
+	}
+}
+
+@(private = "file")
+short :: proc(s: string) -> string {
+	if len(s) <= 18 do return s
+	return s[:18]
+}
