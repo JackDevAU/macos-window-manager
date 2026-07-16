@@ -297,12 +297,12 @@ print_ax_windows :: proc(pid: i32, app: string) {
 	for i in 0 ..< n {
 		w := mac.AXUIElement(mac.CFArrayGetValueAtIndex(wins, i))
 
-		title, _ := mac.ax_string(w, "AXTitle")
+		title, _ := mac.ax_title(w)
 		defer delete(title)
 		role, _ := mac.ax_string(w, "AXRole")
 		defer delete(role)
-		pos, _ := mac.ax_point(w, "AXPosition")
-		sz, _ := mac.ax_size(w, "AXSize")
+		pos, _ := mac.ax_position(w)
+		sz, _ := mac.ax_size(w)
 
 		fmt.printfln(
 			"      - %-50q %s  (%.0f,%.0f  %.0fx%.0f)",
@@ -333,11 +333,11 @@ cmd_poke :: proc(app_name: string) {
 	fmt.printfln("target: %s (pid %d)\n", app_name, pid)
 
 	// Snapshot the original frame so we can put it back exactly.
-	orig_pos, _ := mac.ax_point(w, "AXPosition")
-	orig_size, _ := mac.ax_size(w, "AXSize")
+	orig_pos, _ := mac.ax_position(w)
+	orig_size, _ := mac.ax_size(w)
 	report("original", w)
 
-	fmt.printfln("  AXRaise -> %v", mac.ax_perform(w, "AXRaise"))
+	fmt.printfln("  AXRaise -> %v", mac.ax_raise(w))
 	pause()
 
 	do_move(w, "move (120,120)", {120, 120})
@@ -359,16 +359,16 @@ cmd_poke :: proc(app_name: string) {
 	// see whether the app honors it (parkable) or the OS/app clamps it back.
 	fmt.println("\n-- off-screen parking test --")
 	park := CF.CGPoint{disp.origin.x + disp.size.width + 4000, disp.origin.y + 200}
-	mac.ax_set_point(w, "AXPosition", park)
+	mac.ax_set_position(w, park)
 	pause()
-	actual, _ := mac.ax_point(w, "AXPosition")
+	actual, _ := mac.ax_position(w)
 	verdict := f64(actual.x) >= f64(park.x) - 1 ? "PARKED fully off-screen" : "CLAMPED back toward screen"
 	fmt.printfln("  requested x=%.0f  ->  actual x=%.0f   [%s]", f64(park.x), f64(actual.x), verdict)
 
 	// Restore the original frame.
 	fmt.println("\n-- restore --")
-	mac.ax_set_size(w, "AXSize", orig_size)
-	mac.ax_set_point(w, "AXPosition", orig_pos)
+	mac.ax_set_size(w, orig_size)
+	mac.ax_set_position(w, orig_pos)
 	pause()
 	report("restored", w)
 }
@@ -378,19 +378,19 @@ pause :: proc() {
 }
 
 report :: proc(label: string, w: mac.AXUIElement) {
-	p, _ := mac.ax_point(w, "AXPosition")
-	s, _ := mac.ax_size(w, "AXSize")
+	p, _ := mac.ax_position(w)
+	s, _ := mac.ax_size(w)
 	fmt.printfln("  %-16s (%.0f,%.0f  %.0fx%.0f)", label, f64(p.x), f64(p.y), f64(s.width), f64(s.height))
 }
 
 do_move :: proc(w: mac.AXUIElement, label: string, p: CF.CGPoint) {
-	mac.ax_set_point(w, "AXPosition", p)
+	mac.ax_set_position(w, p)
 	pause()
 	report(label, w)
 }
 
 do_size :: proc(w: mac.AXUIElement, label: string, s: CF.CGSize) {
-	mac.ax_set_size(w, "AXSize", s)
+	mac.ax_set_size(w, s)
 	pause()
 	report(label, w)
 }
@@ -516,7 +516,7 @@ cmd_focused :: proc() {
 	}
 	defer CF.Release(CF.TypeRef(w))
 
-	title, _ := mac.ax_string(w, "AXTitle")
+	title, _ := mac.ax_title(w)
 	defer delete(title)
 	win := win_rect(w)
 	cx, cy := layout.center_of(win)
@@ -598,7 +598,7 @@ cmd_move_monitor :: proc(dir: string) {
 	dst := to_rect(mac.visible_frame(target))
 	moved := layout.remap(win, src, dst)
 	mac.set_frame(w, to_cg(moved))
-	mac.ax_perform(w, "AXRaise")
+	mac.ax_raise(w)
 
 	fmt.printfln("move-monitor %s -> (%.0f,%.0f  %.0fx%.0f)", dir, moved.x, moved.y, moved.w, moved.h)
 }
@@ -606,8 +606,8 @@ cmd_move_monitor :: proc(dir: string) {
 // --- small conversion / parsing helpers ---
 
 win_rect :: proc(w: mac.AXUIElement) -> layout.Rect {
-	p, _ := mac.ax_point(w, "AXPosition")
-	s, _ := mac.ax_size(w, "AXSize")
+	p, _ := mac.ax_position(w)
+	s, _ := mac.ax_size(w)
 	return {f64(p.x), f64(p.y), f64(s.width), f64(s.height)}
 }
 

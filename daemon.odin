@@ -287,7 +287,9 @@ timer_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 	// monitors and re-adopt windows from scratch so nothing is stranded on a
 	// monitor that no longer exists (which would otherwise be an out-of-range mon).
 	buf: [16]u32
-	if len(mac.active_displays(buf[:])) != len(g.monitors) {
+	n_displays := len(mac.active_displays(buf[:]))
+	if n_displays == 0 do return // lid closed / displays asleep: rebuilding now would leave zero monitors and crash cur_mon; wait for wake
+	if n_displays != len(g.monitors) {
 		full_resync()
 		if g.live do run_effector(nil)
 		mac.wm_bar_status_refresh()
@@ -791,6 +793,12 @@ raise_focused :: proc() {
 		mac.focus_window(m.ax, m.pid)
 		g_focus_hold = FOCUS_HOLD_TICKS // hold off OS-focus polling while this settles
 		g_last_synced_id = id // our own focus, not an external change to follow
+		// Mouse follows focus: warp to the window's center (crosses monitors).
+		if pos, p_ok := mac.ax_position(m.ax); p_ok {
+			if sz, s_ok := mac.ax_size(m.ax); s_ok {
+				mac.warp_mouse(f64(pos.x) + f64(sz.width) / 2, f64(pos.y) + f64(sz.height) / 2)
+			}
+		}
 	}
 }
 
@@ -798,16 +806,10 @@ raise_focused :: proc() {
 // (e.g. after a mouse click). Returns false if that window isn't one we manage.
 @(private = "file")
 sync_focus_from_os :: proc() -> bool {
-	w, ok := mac.focused_window()
+	id, ok := frontmost_managed()
 	if !ok do return false
-	defer CF.Release(CF.TypeRef(w))
-	for id, m in g.reg {
-		if bool(mac.CFEqual(CF.TypeRef(m.ax), CF.TypeRef(w))) {
-			focus_window_id(id)
-			return true
-		}
-	}
-	return false
+	focus_window_id(id)
+	return true
 }
 
 @(private = "file")
@@ -918,14 +920,6 @@ frontmost_managed :: proc() -> (layout.Window_Id, bool) {
 	return 0, false
 }
 
-// A rect covering `frac` of the viewport, centred in it.
-@(private = "file")
-centered_rect :: proc(vp: layout.Rect, frac: f64) -> layout.Rect {
-	w := vp.w * frac
-	h := vp.h * frac
-	return {vp.x + (vp.w - w) / 2, vp.y + (vp.h - h) / 2, w, h}
-}
-
 // Toggle a window between tiled and floating. Floating pops it out of the strip,
 // centres it, and raises it so it's a free, draggable window the daemon no longer
 // touches; un-floating re-tiles it. The target is the OS-frontmost managed window
@@ -958,7 +952,7 @@ toggle_float_focused :: proc() {
 			mac.ax_set_minimized(m.ax, false)
 			set_hidden(id, false)
 		}
-		mac.set_frame(m.ax, to_cg(centered_rect(cur_mon().viewport, 0.6)))
+		mac.set_frame(m.ax, to_cg(layout.apply_preset(cur_mon().viewport, .Center)))
 		mac.focus_window(m.ax, m.pid) // raise + focus so it's draggable immediately
 	}
 }
@@ -1147,7 +1141,7 @@ render_state :: proc(b: ^strings.Builder) {
 			fmt.sbprintf(b, ci == s.focused_col ? "  > col%d w=%.2f:" : "    col%d w=%.2f:", ci, col.width_frac)
 			for tile, ti in col.tiles {
 				star := ci == s.focused_col && ti == col.focused_tile ? "*" : ""
-				fmt.sbprintf(b, " [%d %s%s]", u64(tile.id), short(g.reg[tile.id].title), star)
+				fmt.sbprintf(b, " [%d %s%s]", u64(tile.id), clip(g.reg[tile.id].title, 18), star)
 			}
 			fmt.sbprintln(b)
 		}
@@ -1216,7 +1210,7 @@ apply_monitor :: proc(b: ^strings.Builder, mi: int) {
 				// animation) or minimize. Mark hidden so reconcile doesn't mistake
 				// the vanished-from-enumeration window for a closed one.
 				if g.hide_offscreen {
-					mac.set_frame(m.ax, to_cg(hidden_rect(p.rect, p.side, mon.viewport)), size_first = true)
+					mac.set_frame(m.ax, to_cg(hidden_rect(p.rect, mon.viewport)), size_first = true)
 				} else {
 					mac.ax_set_minimized(m.ax, true)
 				}
@@ -1228,7 +1222,7 @@ apply_monitor :: proc(b: ^strings.Builder, mi: int) {
 			fmt.sbprintfln(
 				b,
 				"  win %d %-20s (%.0f,%.0f %.0fx%.0f) %s%s",
-				u64(p.id), short(m.title),
+				u64(p.id), clip(m.title, 18),
 				p.rect.x, p.rect.y, p.rect.w, p.rect.h,
 				p.visible ? "visible" : "HIDDEN", applied,
 			)
@@ -1412,8 +1406,8 @@ update_focus_ring :: proc() {
 		mac.wm_ring_hide()
 		return
 	}
-	pos, p_ok := mac.ax_point(m.ax, "AXPosition")
-	sz, s_ok := mac.ax_size(m.ax, "AXSize")
+	pos, p_ok := mac.ax_position(m.ax)
+	sz, s_ok := mac.ax_size(m.ax)
 	if p_ok && s_ok {
 		mac.wm_ring_show(f64(pos.x), f64(pos.y), f64(sz.width), f64(sz.height))
 	} else {
@@ -1434,7 +1428,7 @@ EDGE_REVEAL :: 6.0
 // (Assumes a horizontal display arrangement, the common case; a display stacked
 // directly below would still see the peek.)
 @(private = "file")
-hidden_rect :: proc(r: layout.Rect, side: layout.Hide_Side, v: layout.Rect) -> layout.Rect {
+hidden_rect :: proc(r: layout.Rect, v: layout.Rect) -> layout.Rect {
 	return {r.x, v.y + v.h - EDGE_REVEAL, r.w, r.h}
 }
 
@@ -1487,7 +1481,7 @@ learn_widths :: proc(s: ^layout.Strip) {
 		id := col.tiles[col.focused_tile].id
 		m, ok := g.reg[id]
 		if !ok || m.hidden || m.req_w <= 0 do continue // only on-screen, already-asked windows
-		sz, got := mac.ax_size(m.ax, "AXSize")
+		sz, got := mac.ax_size(m.ax)
 		if !got do continue
 		actual := f64(sz.width)
 		if actual < m.req_w - WIDTH_TOL {
@@ -1496,8 +1490,3 @@ learn_widths :: proc(s: ^layout.Strip) {
 	}
 }
 
-@(private = "file")
-short :: proc(s: string) -> string {
-	if len(s) <= 18 do return s
-	return s[:18]
-}

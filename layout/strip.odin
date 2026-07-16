@@ -40,6 +40,7 @@ Strip :: struct {
 }
 
 // niri-style width presets cycled by cycle_width.
+@(rodata)
 WIDTH_PRESETS := [3]f64{1.0 / 3.0, 1.0 / 2.0, 2.0 / 3.0}
 
 DEFAULT_WIDTH :: 0.5
@@ -93,24 +94,34 @@ add_tile :: proc(s: ^Strip, id: Window_Id) {
 	col.focused_tile = len(col.tiles) - 1
 }
 
+// Remove tile `ti` from column `ci`, collapsing the column if it empties and
+// keeping the strip's focus indices valid. Returns whether the column collapsed
+// (callers holding column indices right of `ci` must shift them down by one).
+@(private = "file")
+remove_tile_at :: proc(s: ^Strip, ci, ti: int) -> (collapsed: bool) {
+	col := &s.columns[ci]
+	ordered_remove(&col.tiles, ti)
+	if len(col.tiles) == 0 {
+		delete(col.tiles)
+		ordered_remove(&s.columns, ci)
+		if ci < s.focused_col do s.focused_col -= 1
+		if s.focused_col >= len(s.columns) {
+			s.focused_col = max(0, len(s.columns) - 1)
+		}
+		return true
+	}
+	if col.focused_tile >= len(col.tiles) {
+		col.focused_tile = len(col.tiles) - 1
+	}
+	return false
+}
+
 // Remove the tile holding `id`, collapsing its column if it becomes empty.
 remove_window :: proc(s: ^Strip, id: Window_Id) -> bool {
-	for ci := 0; ci < len(s.columns); ci += 1 {
-		col := &s.columns[ci]
-		for ti in 0 ..< len(col.tiles) {
-			if col.tiles[ti].id != id do continue
-
-			ordered_remove(&col.tiles, ti)
-			if len(col.tiles) == 0 {
-				delete(col.tiles)
-				ordered_remove(&s.columns, ci)
-				if ci < s.focused_col do s.focused_col -= 1
-				if s.focused_col >= len(s.columns) {
-					s.focused_col = max(0, len(s.columns) - 1)
-				}
-			} else if col.focused_tile >= len(col.tiles) {
-				col.focused_tile = len(col.tiles) - 1
-			}
+	for ci in 0 ..< len(s.columns) {
+		for ti in 0 ..< len(s.columns[ci].tiles) {
+			if s.columns[ci].tiles[ti].id != id do continue
+			remove_tile_at(s, ci, ti)
 			return true
 		}
 	}
@@ -207,18 +218,11 @@ consume_into_column :: proc(s: ^Strip) {
 	if len(next.tiles) == 0 do return
 
 	moved := next.tiles[next.focused_tile]
-	ordered_remove(&next.tiles, next.focused_tile)
+	remove_tile_at(s, s.focused_col + 1, next.focused_tile)
 
 	cur := &s.columns[s.focused_col]
 	append(&cur.tiles, moved)
 	cur.focused_tile = len(cur.tiles) - 1
-
-	if len(next.tiles) == 0 {
-		delete(next.tiles)
-		ordered_remove(&s.columns, s.focused_col + 1)
-	} else if next.focused_tile >= len(next.tiles) {
-		next.focused_tile = len(next.tiles) - 1
-	}
 }
 
 // Push the focused tile out into its own new column to the right.
@@ -261,17 +265,8 @@ regroup_into :: proc(s: ^Strip, id: Window_Id, dst_in: int) -> bool {
 
 	moved := s.columns[src].tiles[ti]
 
-	// Remove from the source column, collapsing it if it empties (mirrors
-	// remove_window). A collapse left of `dst` shifts `dst` one to the left.
-	scol := &s.columns[src]
-	ordered_remove(&scol.tiles, ti)
-	if len(scol.tiles) == 0 {
-		delete(scol.tiles)
-		ordered_remove(&s.columns, src)
-		if src < dst do dst -= 1
-	} else if scol.focused_tile >= len(scol.tiles) {
-		scol.focused_tile = len(scol.tiles) - 1
-	}
+	// A collapse left of `dst` shifts `dst` one to the left.
+	if remove_tile_at(s, src, ti) && src < dst do dst -= 1
 
 	dcol := &s.columns[dst]
 	append(&dcol.tiles, moved)
@@ -282,18 +277,10 @@ regroup_into :: proc(s: ^Strip, id: Window_Id, dst_in: int) -> bool {
 
 // --- layout -----------------------------------------------------------------
 
-// Which edge an off-view window is hidden against (so it peeks on that side).
-Hide_Side :: enum {
-	None, // visible
-	Left,
-	Right,
-}
-
 Placement :: struct {
 	id:      Window_Id,
 	rect:    Rect,
 	visible: bool, // false => scrolled out of view; effector should hide it
-	side:    Hide_Side, // for !visible: which edge it scrolled off
 }
 
 // Lay out ALL windows in the workspace as a grid filling the viewport (every
@@ -340,12 +327,10 @@ compute_monocle :: proc(s: ^Strip, viewport: Rect, allocator := context.allocato
 		nt := len(col.tiles)
 		if nt == 0 do continue
 		visible := ci == s.focused_col
-		side := Hide_Side.None
-		if !visible do side = ci < s.focused_col ? .Left : .Right
 		tile_h := (content_h - f64(nt - 1) * gap) / f64(nt)
 		for tile, j in col.tiles {
 			ty := viewport.y + gap + f64(j) * (tile_h + gap)
-			append(&out, Placement{id = tile.id, rect = {x, ty, w, tile_h}, visible = visible, side = side})
+			append(&out, Placement{id = tile.id, rect = {x, ty, w, tile_h}, visible = visible})
 		}
 	}
 	return out[:]
@@ -392,17 +377,12 @@ compute_layout :: proc(s: ^Strip, viewport: Rect, allocator := context.allocator
 		w := widths[i]
 		visible := (screen_x + w > viewport.x) && (screen_x < viewport.x + viewport.w)
 
-		side := Hide_Side.None
-		if !visible {
-			side = screen_x < viewport.x ? .Left : .Right
-		}
-
 		nt := len(col.tiles)
 		if nt == 0 do continue
 		tile_h := (content_h - f64(nt - 1) * gap) / f64(nt)
 		for tile, j in col.tiles {
 			ty := viewport.y + gap + f64(j) * (tile_h + gap)
-			append(&out, Placement{id = tile.id, rect = {screen_x, ty, w, tile_h}, visible = visible, side = side})
+			append(&out, Placement{id = tile.id, rect = {screen_x, ty, w, tile_h}, visible = visible})
 		}
 	}
 	return out[:]

@@ -249,7 +249,7 @@ test_layout_scrolls_and_hides_offscreen :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_layout_hide_side :: proc(t: ^testing.T) {
+test_layout_hides_scrolled_out_columns :: proc(t: ^testing.T) {
 	s := make_strip(0)
 	defer strip_destroy(&s)
 	for id in 1 ..= 5 do add_window(&s, Window_Id(id), 0.5)
@@ -262,11 +262,10 @@ test_layout_hide_side :: proc(t: ^testing.T) {
 	p3, _ := find(ps, 3)
 	p4, _ := find(ps, 4)
 	p5, _ := find(ps, 5)
-	testing.expect_value(t, p1.side, Hide_Side.Left) // scrolled off the left
+	testing.expect(t, !p1.visible) // scrolled off the left
 	testing.expect(t, p3.visible) // focused, on screen
-	testing.expect_value(t, p3.side, Hide_Side.None)
-	testing.expect_value(t, p4.side, Hide_Side.Right) // off the right
-	testing.expect_value(t, p5.side, Hide_Side.Right)
+	testing.expect(t, !p4.visible) // off the right
+	testing.expect(t, !p5.visible)
 }
 
 @(test)
@@ -317,12 +316,10 @@ test_monocle_shows_only_focused_full_screen :: proc(t: ^testing.T) {
 	p2, _ := find(ps, 2)
 	p3, _ := find(ps, 3)
 	// Only the focused column shows, filling the whole viewport regardless of
-	// width_frac; the others are hidden off their respective sides.
+	// width_frac; the others are hidden.
 	testing.expect(t, p2.visible)
 	testing.expect_value(t, p2.rect, Rect{0, 0, 1000, 1000})
 	testing.expect(t, !p1.visible && !p3.visible)
-	testing.expect_value(t, p1.side, Hide_Side.Left)
-	testing.expect_value(t, p3.side, Hide_Side.Right)
 }
 
 @(test)

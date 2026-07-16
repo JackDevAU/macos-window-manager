@@ -160,7 +160,7 @@ ax_get :: proc(el: AXUIElement, attr: cstring) -> (CF.TypeRef, bool) {
 	return val, err == .Success && val != nil
 }
 
-// Read a string-valued AX attribute (e.g. AXTitle, AXRole). Caller frees the string.
+// Read a string-valued AX attribute (e.g. AXRole, AXSubrole). Caller frees the string.
 ax_string :: proc(el: AXUIElement, attr: cstring, allocator := context.allocator) -> (string, bool) {
 	val, ok := ax_get(el, attr)
 	if !ok do return "", false
@@ -168,13 +168,18 @@ ax_string :: proc(el: AXUIElement, attr: cstring, allocator := context.allocator
 	return CF.StringCopyToOdinString(CF.String(val), allocator)
 }
 
-// Read an AXPosition-style attribute (an AXValue wrapping a CGPoint).
+// A window's title. Caller frees the string.
+ax_title :: proc(el: AXUIElement, allocator := context.allocator) -> (string, bool) {
+	return ax_string(el, "AXTitle", allocator)
+}
+
+// A window's top-left position (global CG coordinates).
 //
 // Note: AXValueGetValue must be called *before* building the return tuple.
 // `return p, bool(AXValueGetValue(..., &p))` would copy `p` (still zero) for the
 // first result before the call mutates it — an evaluation-order trap.
-ax_point :: proc(el: AXUIElement, attr: cstring) -> (CF.CGPoint, bool) {
-	val, ok := ax_get(el, attr)
+ax_position :: proc(el: AXUIElement) -> (CF.CGPoint, bool) {
+	val, ok := ax_get(el, "AXPosition")
 	if !ok do return {}, false
 	defer CF.Release(val)
 	p: CF.CGPoint
@@ -182,9 +187,9 @@ ax_point :: proc(el: AXUIElement, attr: cstring) -> (CF.CGPoint, bool) {
 	return p, got
 }
 
-// Read an AXSize-style attribute (an AXValue wrapping a CGSize).
-ax_size :: proc(el: AXUIElement, attr: cstring) -> (CF.CGSize, bool) {
-	val, ok := ax_get(el, attr)
+// A window's size.
+ax_size :: proc(el: AXUIElement) -> (CF.CGSize, bool) {
+	val, ok := ax_get(el, "AXSize")
 	if !ok do return {}, false
 	defer CF.Release(val)
 	s: CF.CGSize
@@ -192,33 +197,38 @@ ax_size :: proc(el: AXUIElement, attr: cstring) -> (CF.CGSize, bool) {
 	return s, got
 }
 
-// Write a CGPoint-valued attribute (e.g. AXPosition).
-ax_set_point :: proc(el: AXUIElement, attr: cstring, point: CF.CGPoint) -> AXError {
+// Move a window (write AXPosition).
+ax_set_position :: proc(el: AXUIElement, point: CF.CGPoint) -> AXError {
 	p := point
 	v := AXValueCreate(.CGPoint, &p)
 	if v == nil do return .Failure
 	defer CF.Release(CF.TypeRef(v))
-	a := cf_str(attr)
+	a := cf_str("AXPosition")
 	defer CF.Release(CF.TypeRef(a))
 	return AXUIElementSetAttributeValue(el, a, CF.TypeRef(v))
 }
 
-// Write a CGSize-valued attribute (e.g. AXSize).
-ax_set_size :: proc(el: AXUIElement, attr: cstring, size: CF.CGSize) -> AXError {
+// Resize a window (write AXSize).
+ax_set_size :: proc(el: AXUIElement, size: CF.CGSize) -> AXError {
 	s := size
 	v := AXValueCreate(.CGSize, &s)
 	if v == nil do return .Failure
 	defer CF.Release(CF.TypeRef(v))
-	a := cf_str(attr)
+	a := cf_str("AXSize")
 	defer CF.Release(CF.TypeRef(a))
 	return AXUIElementSetAttributeValue(el, a, CF.TypeRef(v))
 }
 
-// Perform an AX action (e.g. AXRaise).
+// Perform an AX action.
 ax_perform :: proc(el: AXUIElement, action: cstring) -> AXError {
 	a := cf_str(action)
 	defer CF.Release(CF.TypeRef(a))
 	return AXUIElementPerformAction(el, a)
+}
+
+// Bring a window to the front of its app's z-order (does not focus its app).
+ax_raise :: proc(el: AXUIElement) -> AXError {
+	return ax_perform(el, "AXRaise")
 }
 
 // Whether an attribute can be written (e.g. AXSize on a resizable window). Used
@@ -245,14 +255,14 @@ ax_settable :: proc(el: AXUIElement, attr: cstring) -> bool {
 // default grow heuristic would otherwise move the small window off first, where
 // growing it drags it back on-screen.
 set_frame :: proc(w: AXUIElement, rect: CF.CGRect, size_first := false) {
-	cur, _ := ax_size(w, "AXSize")
+	cur, _ := ax_size(w)
 	grow := f64(rect.size.width) > f64(cur.width) + 0.5 || f64(rect.size.height) > f64(cur.height) + 0.5
 	if grow && !size_first {
-		ax_set_point(w, "AXPosition", rect.origin)
-		ax_set_size(w, "AXSize", rect.size)
+		ax_set_position(w, rect.origin)
+		ax_set_size(w, rect.size)
 	} else {
-		ax_set_size(w, "AXSize", rect.size)
-		ax_set_point(w, "AXPosition", rect.origin)
+		ax_set_size(w, rect.size)
+		ax_set_position(w, rect.origin)
 	}
 }
 

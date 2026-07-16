@@ -20,16 +20,22 @@ typedef struct {
 	double x, y, w, h; // visibleFrame, CG top-left global coords
 } WMVisibleFrame;
 
+// AppKit's global space has its origin at the bottom-left of the primary
+// screen (screens[0]) with y pointing up; CG/AX use top-left, y down. Every
+// AppKit<->CG conversion flips using the primary screen's full height.
+// Returns 0 when there are no screens (callers bail).
+static double primary_screen_height(void) {
+	NSArray<NSScreen *> *screens = [NSScreen screens];
+	return screens.count > 0 ? [(NSScreen *)screens[0] frame].size.height : 0;
+}
+
 // Fill `out` with up to `max` displays' visible frames. Returns the count.
 int wm_visible_frames(WMVisibleFrame *out, int max) {
 	NSArray<NSScreen *> *screens = [NSScreen screens];
 	if (screens.count == 0) {
 		return 0;
 	}
-	// AppKit's global space has its origin at the bottom-left of the primary
-	// screen (screens[0]) with y pointing up; CG/AX use top-left, y down. Flip
-	// using the primary screen's full height.
-	double primaryH = [(NSScreen *)screens[0] frame].size.height;
+	double primaryH = primary_screen_height();
 
 	int n = (int)screens.count;
 	if (n > max) {
@@ -104,11 +110,10 @@ static void ensure_ring(void) {
 // origin, y-down) and show it.
 void wm_ring_show(double x, double y, double w, double h) {
 	ensure_ring();
-	NSArray<NSScreen *> *screens = [NSScreen screens];
-	if (screens.count == 0) {
+	double primaryH = primary_screen_height();
+	if (primaryH == 0) {
 		return;
 	}
-	double primaryH = [(NSScreen *)screens[0] frame].size.height;
 	double nsY = primaryH - (y + h); // flip top-left -> AppKit bottom-left
 	[gRing setFrame:NSMakeRect(x, nsY, w, h) display:YES];
 	[gRing orderFront:nil];
@@ -448,11 +453,10 @@ static WMBarView *ensure_bar(int idx) {
 // Position bar `idx` (CG top-left coords) and set its segments.
 void wm_bar_set(int idx, const WMBarSeg *segs, int count, double x, double y, double w, double h) {
 	WMBarView *view = ensure_bar(idx);
-	NSArray<NSScreen *> *screens = [NSScreen screens];
-	if (screens.count == 0) {
+	double primaryH = primary_screen_height();
+	if (primaryH == 0) {
 		return;
 	}
-	double primaryH = [(NSScreen *)screens[0] frame].size.height;
 	double nsY = primaryH - (y + h);
 	[gBars[idx] setFrame:NSMakeRect(x, nsY, w, h) display:YES];
 	[view setSegs:segs count:count];
@@ -913,7 +917,7 @@ void wm_settings_set_rows(const WMSettingsRow *rows, int count) {
 	host.wantsLayer = YES;
 	_win.contentView = host;
 
-	_frameQueue = dispatch_queue_create("info.pettit.niri.stage", DISPATCH_QUEUE_SERIAL);
+	_frameQueue = dispatch_queue_create("com.niri-mac.stage", DISPATCH_QUEUE_SERIAL);
 }
 
 - (void)captureWindow:(CGWindowID)wid {

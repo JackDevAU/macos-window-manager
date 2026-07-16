@@ -40,7 +40,7 @@ focus_window :: proc(w: AXUIElement, pid: i32) {
 	defer CF.Release(CF.TypeRef(ma))
 	AXUIElementSetAttributeValue(w, ma, kCFBooleanTrue)
 
-	ax_perform(w, "AXRaise")
+	ax_raise(w)
 
 	app := AXUIElementCreateApplication(c.int(pid))
 	defer CF.Release(CF.TypeRef(app))
@@ -105,9 +105,9 @@ standard_windows :: proc(app_filter: string = "", allocator := context.allocator
 			delete(subrole)
 			if !standard do continue
 
-			title, _ := ax_string(w, "AXTitle")
-			pos, _ := ax_point(w, "AXPosition")
-			sz, _ := ax_size(w, "AXSize")
+			title, _ := ax_title(w)
+			pos, _ := ax_position(w)
+			sz, _ := ax_size(w)
 			append(&out, Std_Window{
 				pid   = pid,
 				ax    = AXUIElement(CFRetain(CF.TypeRef(w))),

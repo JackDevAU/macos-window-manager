@@ -107,6 +107,17 @@ foreign cgrl {
 	CGEventCreateKeyboardEvent :: proc(source: rawptr, keycode: u16, keyDown: b8) -> CGEvent ---
 	CGEventSetFlags :: proc(event: CGEvent, flags: u64) ---
 	CGEventPost :: proc(tap: u32, event: CGEvent) ---
+
+	CGWarpMouseCursorPosition :: proc(newCursorPosition: CF.CGPoint) -> i32 ---
+	CGAssociateMouseAndMouseCursorPosition :: proc(connected: b8) -> i32 ---
+}
+
+// Move the mouse cursor to (x, y) in global CG coordinates (top-left origin,
+// same space as AXPosition). Works across displays. The re-associate call
+// cancels the ~0.25s input freeze CGWarpMouseCursorPosition otherwise imposes.
+warp_mouse :: proc(x, y: f64) {
+	CGWarpMouseCursorPosition(CF.CGPoint{CF.CGFloat(x), CF.CGFloat(y)})
+	CGAssociateMouseAndMouseCursorPosition(true)
 }
 
 // Synthesize a keyboard event with modifier flags and post it (used by the
