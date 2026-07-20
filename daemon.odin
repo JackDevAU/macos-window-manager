@@ -6,7 +6,10 @@ import "core:fmt"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:sys/posix"
+import "core:thread"
+import "core:time"
 import CF "core:sys/darwin/CoreFoundation"
 import "layout"
 import mac "macos"
@@ -15,13 +18,16 @@ import mac "macos"
 Managed :: struct {
 	pid:     i32,
 	ax:      mac.AXUIElement, // retained
+	cgwin:   u32, // CGWindowID (0 if unknown) — non-AX frame reads for slow apps
 	title:   string, // allocated
 	app:     string, // allocated (owning app name)
 	mon:     int, // which monitor (index into g.monitors) this window tiles on
 	ws:      int, // workspace within that monitor
 	hidden:  bool, // hidden by us (so reconcile won't mistake it for closed)
 	floated: bool, // user-excluded from tiling (Alt+F) — left where it is
+	loose:   bool, // AX-slow app (a game): full-screen column, minimal AX traffic
 	req_w:   f64, // width we last asked this window to be (to detect clamping)
+	placed:  layout.Rect, // frame the effector last applied (loose: skip repeat writes)
 	orig:    layout.Rect, // frame when first managed, restored on un-tile
 }
 
@@ -85,8 +91,30 @@ g_click_sync: int
 @(private = "file")
 g_last_synced_id: layout.Window_Id
 
+// A window we asked to become frontmost but that hasn't activated yet. A loose
+// app (Godot) activates asynchronously and slowly (~1s); until it does, the OS
+// still reports the *previous* window as frontmost, so the OS-focus-follow tick
+// would snap focus straight back off Godot ("go to Godot, it bounces back").
+// While this is set, the follow tick is suppressed until this pid is actually
+// frontmost or the deadline passes.
+@(private = "file")
+g_activating_pid: i32
+@(private = "file")
+g_activating_until: mac.CFAbsoluteTime
+
+// A loose window the user has navigated onto but not yet settled on. We hold off
+// raising/activating it (an expensive, slow AX op that also steals the app
+// frontmost) until the cursor has dwelt on it — so spam-navigating *past* Godot
+// never activates it, while stopping *on* it does (long wait is fine then).
+@(private = "file")
+g_pending_raise_id: layout.Window_Id
+@(private = "file")
+g_pending_raise_at: mac.CFAbsoluteTime
+
 FOCUS_HOLD_TICKS :: 3
 CLICK_SYNC_TICKS :: 4
+ACTIVATE_TIMEOUT :: mac.CFAbsoluteTime(2.0) // give up waiting for a window to come frontmost
+LOOSE_RAISE_DWELL :: mac.CFAbsoluteTime(0.18) // settle time before raising a slow window
 
 GAP :: 12
 IDLE_MS :: 500
@@ -141,6 +169,13 @@ Cmd + Tab                  native macOS switcher (the WM follows your pick)`
 KEY_TAB :: 48 // used with Cmd for the window switcher
 
 run_daemon :: proc(manage_app: string = "") {
+	// One app with a slow AX server (a game, Godot) must not freeze our run
+	// loop: the event tap lives on it, so every keystroke system-wide queues
+	// behind these synchronous AX calls. The real caps are per-element
+	// (mac.ax_app / standard_windows) plus the per-pid slow-app backoff in the
+	// macos package; this global cap is only a safety net for stray elements.
+	mac.ax_set_global_timeout(mac.AX_CALL_TIMEOUT)
+
 	g.reg = make(map[layout.Window_Id]Managed)
 	g.ignore_apps = make(map[string]bool)
 	build_monitors() // one independent tiling area per physical display
@@ -186,6 +221,17 @@ run_daemon :: proc(manage_app: string = "") {
 	ftimer := mac.CFRunLoopTimerCreate(nil, mac.CFAbsoluteTimeGetCurrent() + fi, fi, 0, 0, focus_cb, nil)
 	mac.CFRunLoopAddTimer(rl, ftimer, mac.kCFRunLoopDefaultMode)
 
+	// Slow lane: AX-backed-off apps (Godot answers each AX call in ~255ms)
+	// still deserve tiling. This worker enumerates their windows with patient
+	// timeouts, blocking only itself; reconcile drains the results.
+	g_slow_thread = thread.create_and_start(slow_lane_loop)
+
+	// Writer threads: perform every window AX write off the main thread (see the
+	// window-writer section). Two of them so slow (Godot) writes never stall the
+	// fast windows queued behind them.
+	g_fast_q.thread = thread.create_and_start(fast_writer_loop)
+	g_slow_q.thread = thread.create_and_start(slow_writer_loop)
+
 	scope := manage_app == "" ? "all apps" : manage_app
 	fmt.printfln("niri-mac daemon listening on %s", SOCKET_PATH)
 	fmt.printfln("  managing %s, TILING (use `wm live off` or Alt+T to pause)", scope)
@@ -203,6 +249,21 @@ run_daemon :: proc(manage_app: string = "") {
 	// Run the AppKit event loop (not a bare CFRunLoopRun) so the settings window's
 	// controls receive mouse events; it still services our tap/socket/timers.
 	mac.wm_app_run()
+
+	g_slow_quit = true
+	if g_slow_thread != nil do thread.join(g_slow_thread)
+	for w in g_slow_wins do mac.std_window_destroy(w)
+	delete(g_slow_wins)
+
+	// Stop the writer threads (wake them so they see the quit flag), then release
+	// any retains still sitting in their queues.
+	g_writer_quit = true
+	sync.sema_post(&g_fast_q.sema)
+	sync.sema_post(&g_slow_q.sema)
+	if g_fast_q.thread != nil do thread.join(g_fast_q.thread)
+	if g_slow_q.thread != nil do thread.join(g_slow_q.thread)
+	drain_writer_queue(&g_fast_q)
+	drain_writer_queue(&g_slow_q)
 
 	mac.wm_bar_hide()
 	mac.wm_ring_hide()
@@ -267,6 +328,138 @@ monitor_for_point :: proc(px, py: f64) -> int {
 	return g.focused_monitor
 }
 
+// --- slow lane (worker thread) ----------------------------------------------
+// Windows of AX-backed-off apps, enumerated off the main thread with patient
+// timeouts so the event tap never waits on them. reconcile drains the batch.
+g_slow_wins: [dynamic]mac.Std_Window // guarded by g_slow_mu
+g_slow_mu: sync.Mutex
+g_slow_quit: bool
+g_slow_thread: ^thread.Thread
+
+SLOW_LANE_MS :: 2000
+
+slow_lane_loop :: proc() {
+	for !g_slow_quit {
+		wins := mac.slow_app_windows(g.manage_app)
+		if len(wins) > 0 {
+			sync.mutex_lock(&g_slow_mu)
+			// Replace any undrained batch — newest data wins.
+			for w in g_slow_wins do mac.std_window_destroy(w)
+			clear(&g_slow_wins)
+			for w in wins do append(&g_slow_wins, w)
+			sync.mutex_unlock(&g_slow_mu)
+		}
+		delete(wins)
+		// Sleep in short slices so daemon shutdown never waits the full period.
+		for _ in 0 ..< (SLOW_LANE_MS / 250) {
+			if g_slow_quit do break
+			time.sleep(250 * time.Millisecond)
+		}
+	}
+}
+
+// --- window writer (worker threads) -----------------------------------------
+// EVERY window move/resize/raise goes here, never on the main thread. The main
+// thread runs the CGEventTap that all system input passes through, and it fires
+// run_effector + raise_focused on every focus-nav hotkey; a synchronous AX
+// write there blocks the tap for the app's full AX latency. That's cheap for a
+// snappy app but not for Godot (~255ms) or a busy Electron app (Teams/Discord/
+// Spotify), and it stacks with key-repeat — the "delay between panes". So the
+// tap only mutates in-memory layout state (instant) and queues the AX writes.
+//
+// Two queues, each with its own thread: a FAST queue for snappy apps and a
+// SLOW queue for loose (AX-slow) windows. A single shared thread would let one
+// in-flight ~1s Godot write stall every fast window queued behind it — which is
+// exactly why navigating *past* Godot dragged everything. Splitting them means
+// fast windows never wait on Godot. Frames coalesce per window (a fast scroll
+// enqueues many rects; only the last matters); focus keeps just the latest
+// target. Every queued AXUIElement carries its own +1 retain, released once the
+// op runs, so it stays valid even if the window closes first.
+Frame_Write :: struct {
+	ax:         mac.AXUIElement,
+	rect:       layout.Rect,
+	size_first: bool,
+}
+
+Writer_Queue :: struct {
+	frames:    map[uintptr]Frame_Write, // key: ax pointer
+	focus_ax:  mac.AXUIElement,
+	focus_pid: i32,
+	focus_set: bool,
+	mu:        sync.Mutex,
+	sema:      sync.Sema,
+	thread:    ^thread.Thread,
+}
+
+g_fast_q: Writer_Queue
+g_slow_q: Writer_Queue // loose (AX-slow) windows only
+g_writer_quit: bool
+
+enqueue_frame :: proc(ax: mac.AXUIElement, rect: layout.Rect, size_first: bool, loose: bool) {
+	q := loose ? &g_slow_q : &g_fast_q
+	sync.mutex_lock(&q.mu)
+	if q.frames == nil do q.frames = make(map[uintptr]Frame_Write)
+	key := uintptr(rawptr(ax))
+	if old, ok := q.frames[key]; ok do CF.Release(CF.TypeRef(old.ax)) // superseded
+	mac.CFRetain(CF.TypeRef(ax))
+	q.frames[key] = Frame_Write{ax = ax, rect = rect, size_first = size_first}
+	sync.mutex_unlock(&q.mu)
+	sync.sema_post(&q.sema)
+}
+
+enqueue_focus :: proc(ax: mac.AXUIElement, pid: i32, loose: bool) {
+	q := loose ? &g_slow_q : &g_fast_q
+	sync.mutex_lock(&q.mu)
+	if q.focus_set do CF.Release(CF.TypeRef(q.focus_ax)) // superseded
+	mac.CFRetain(CF.TypeRef(ax))
+	q.focus_ax = ax
+	q.focus_pid = pid
+	q.focus_set = true
+	sync.mutex_unlock(&q.mu)
+	sync.sema_post(&q.sema)
+}
+
+writer_loop :: proc(q: ^Writer_Queue) {
+	for {
+		sync.sema_wait(&q.sema)
+
+		sync.mutex_lock(&q.mu)
+		frames := make([dynamic]Frame_Write, 0, len(q.frames))
+		for _, f in q.frames do append(&frames, f)
+		clear(&q.frames)
+		focus_ax := q.focus_ax
+		focus_pid := q.focus_pid
+		focus_set := q.focus_set
+		q.focus_set = false
+		quit := g_writer_quit
+		sync.mutex_unlock(&q.mu)
+
+		// These block for the target app's AX latency — but on THIS thread, not
+		// the run loop. focus before frame: raising is what the user waits to see.
+		if focus_set {
+			mac.focus_window(focus_ax, focus_pid)
+			CF.Release(CF.TypeRef(focus_ax))
+		}
+		for f in frames {
+			mac.set_frame(f.ax, to_cg(f.rect), f.size_first)
+			CF.Release(CF.TypeRef(f.ax))
+		}
+		delete(frames)
+
+		if quit do return
+	}
+}
+
+fast_writer_loop :: proc() { writer_loop(&g_fast_q) }
+slow_writer_loop :: proc() { writer_loop(&g_slow_q) }
+
+@(private = "file")
+drain_writer_queue :: proc(q: ^Writer_Queue) {
+	for _, f in q.frames do CF.Release(CF.TypeRef(f.ax))
+	delete(q.frames)
+	if q.focus_set do CF.Release(CF.TypeRef(q.focus_ax))
+}
+
 // --- run-loop callbacks (run on the main thread) ----------------------------
 
 @(private = "file")
@@ -295,8 +488,8 @@ timer_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 		mac.wm_bar_status_refresh()
 		return
 	}
-	added, removed := reconcile()
-	if g.live && (added > 0 || removed > 0) {
+	added, removed, retagged := reconcile()
+	if g.live && (added > 0 || removed > 0 || retagged > 0) {
 		run_effector(nil)
 	}
 	mac.wm_bar_status_refresh() // keep the clock/battery/wifi cluster current
@@ -310,6 +503,36 @@ timer_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 @(private = "file")
 focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 	context = runtime.default_context()
+
+	// A slow window the user paused on: once the dwell passes and focus is still
+	// there, raise/activate it (deferred from raise_focused). If focus has moved
+	// on (spam-navigated past), just drop it — we never activate it.
+	if g_pending_raise_id != 0 {
+		if cur, has := layout.focused_window(cur_strip()); has && cur == g_pending_raise_id {
+			if mac.CFAbsoluteTimeGetCurrent() >= g_pending_raise_at {
+				if m, ok := g.reg[g_pending_raise_id]; ok {
+					enqueue_focus(m.ax, m.pid, true)
+					arm_activation_guard(m.pid)
+				}
+				g_pending_raise_id = 0
+			}
+		} else {
+			g_pending_raise_id = 0 // focus left before it settled — skip it
+		}
+	}
+
+	// While a window we activated is still coming frontmost, don't let the
+	// OS-focus-follow below bounce us back to whatever is frontmost right now.
+	if g_activating_pid != 0 {
+		fp := mac.wm_frontmost_pid()
+		if fp == g_activating_pid || mac.CFAbsoluteTimeGetCurrent() >= g_activating_until {
+			g_activating_pid = 0
+		} else {
+			update_focus_ring()
+			return
+		}
+	}
+
 	if g_focus_hold > 0 {
 		// A hotkey just raised a window; let it settle before any click-sync, so
 		// a stale frontmost read can't snap focus back (the old polling bug).
@@ -790,16 +1013,38 @@ raise_focused :: proc() {
 	if !ok do return
 	m, found := g.reg[id]
 	if found {
-		mac.focus_window(m.ax, m.pid)
 		g_focus_hold = FOCUS_HOLD_TICKS // hold off OS-focus polling while this settles
 		g_last_synced_id = id // our own focus, not an external change to follow
-		// Mouse follows focus: warp to the window's center (crosses monitors).
-		if pos, p_ok := mac.ax_position(m.ax); p_ok {
-			if sz, s_ok := mac.ax_size(m.ax); s_ok {
-				mac.warp_mouse(f64(pos.x) + f64(sz.width) / 2, f64(pos.y) + f64(sz.height) / 2)
-			}
+		if m.loose {
+			// Don't raise a slow window just because focus swept over it — that
+			// activation is expensive and, if the user is passing through, wrong.
+			// Defer it: the fast tick raises it only once focus has dwelt here.
+			g_pending_raise_id = id
+			g_pending_raise_at = mac.CFAbsoluteTimeGetCurrent() + LOOSE_RAISE_DWELL
+		} else {
+			// Snappy app: raise now (off the main thread) and guard against the
+			// follow tick bouncing focus away before it comes frontmost.
+			g_pending_raise_id = 0
+			enqueue_focus(m.ax, m.pid, false)
+			arm_activation_guard(m.pid)
+		}
+		// Mouse follows focus: warp to the window's center. Use the rect the
+		// effector just placed it at (m.placed) — no AX read, and it's exactly
+		// where the window is headed even if the async move hasn't landed yet.
+		r := m.placed
+		if r.w > 0 && r.h > 0 {
+			mac.warp_mouse(r.x + r.w / 2, r.y + r.h / 2)
 		}
 	}
+}
+
+// Suppress the OS-focus-follow tick until `pid` is actually the frontmost app
+// (or we time out). Stops the follow logic from snapping focus back off a
+// window whose activation is still in flight.
+@(private = "file")
+arm_activation_guard :: proc(pid: i32) {
+	g_activating_pid = pid
+	g_activating_until = mac.CFAbsoluteTimeGetCurrent() + ACTIVATE_TIMEOUT
 }
 
 // Point the daemon's focus at the window the user actually has focused in the OS
@@ -912,7 +1157,22 @@ mode_name :: proc(m: Layout_Mode) -> string {
 @(private = "file")
 frontmost_managed :: proc() -> (layout.Window_Id, bool) {
 	w, ok := mac.focused_window()
-	if !ok do return 0, false
+	if !ok {
+		// An AX-slow frontmost app (Godot) can't be asked for its focused
+		// window without blocking; if we manage exactly one of its windows,
+		// that must be it — enough for click-focus to keep following.
+		pid := mac.wm_frontmost_pid()
+		if pid > 0 && mac.ax_pid_slow(pid) {
+			found: layout.Window_Id
+			count := 0
+			for id, m in g.reg do if m.pid == pid {
+				found = id
+				count += 1
+			}
+			if count == 1 do return found, true
+		}
+		return 0, false
+	}
 	defer CF.Release(CF.TypeRef(w))
 	for id, m in g.reg {
 		if bool(mac.CFEqual(CF.TypeRef(m.ax), CF.TypeRef(w))) do return id, true
@@ -952,8 +1212,13 @@ toggle_float_focused :: proc() {
 			mac.ax_set_minimized(m.ax, false)
 			set_hidden(id, false)
 		}
-		mac.set_frame(m.ax, to_cg(layout.apply_preset(cur_mon().viewport, .Center)))
-		mac.focus_window(m.ax, m.pid) // raise + focus so it's draggable immediately
+		// Centre + raise so it's draggable immediately — via the writer thread
+		// (loose apps must never take a synchronous AX call on the tap thread).
+		centre := layout.apply_preset(cur_mon().viewport, .Center)
+		set_placed(id, centre)
+		enqueue_frame(m.ax, centre, false, m.loose)
+		enqueue_focus(m.ax, m.pid, m.loose)
+		arm_activation_guard(m.pid)
 	}
 }
 
@@ -1058,9 +1323,36 @@ should_tile :: proc(w: mac.Std_Window) -> bool {
 }
 
 @(private = "file")
-reconcile :: proc() -> (added: int, removed: int) {
+reconcile :: proc() -> (added: int, removed: int, retagged: int) {
 	wins := mac.standard_windows(g.manage_app)
 	defer delete(wins)
+
+	// Merge the slow lane's latest batch: windows of AX-backed-off apps,
+	// enumerated off-thread so this tick never blocked for them. Remember
+	// which pids the batch covered — only those ticks carry enough truth to
+	// declare one of that app's windows closed.
+	slow_batch_pids := make(map[i32]bool)
+	defer delete(slow_batch_pids)
+	sync.mutex_lock(&g_slow_mu)
+	for w in g_slow_wins {
+		slow_batch_pids[w.pid] = true
+		append(&wins, w)
+	}
+	clear(&g_slow_wins)
+	sync.mutex_unlock(&g_slow_mu)
+
+	// Dedup: a pid can leave backoff between a slow-lane batch and this tick,
+	// getting enumerated by both lanes; adopting twice would double-register.
+	for i := 0; i < len(wins); i += 1 {
+		for j := i + 1; j < len(wins); {
+			if bool(mac.CFEqual(CF.TypeRef(wins[i].ax), CF.TypeRef(wins[j].ax))) {
+				mac.std_window_destroy(wins[j])
+				ordered_remove(&wins, j)
+			} else {
+				j += 1
+			}
+		}
+	}
 
 	matched := make([]bool, len(wins))
 	defer delete(matched)
@@ -1077,9 +1369,25 @@ reconcile :: proc() -> (added: int, removed: int) {
 				break
 			}
 		}
+		// Keep the loose tag in sync with the app's AX health, so a recovered
+		// app rejoins real tiling and a newly-slow one stops being polled.
+		if found && m.loose != mac.ax_pid_slow(m.pid) {
+			mm := m
+			mm.loose = !m.loose
+			g.reg[id] = mm
+			retagged += 1
+		}
 		// A window we minimized drops out of the on-screen enumeration; don't
-		// mistake that for the user closing it.
-		if !found && !m.hidden do append(&to_remove, id)
+		// mistake that for the user closing it. Same for an app in AX-timeout
+		// backoff — the fast lane skips it, so its windows are absent, not
+		// gone; trust an absence only when this tick's slow-lane batch
+		// actually covered that pid (otherwise ghosts of closed windows — or
+		// Godot children we stopped tracking — would linger forever).
+		if !found && !m.hidden {
+			if !mac.ax_pid_slow(m.pid) || m.pid in slow_batch_pids {
+				append(&to_remove, id)
+			}
+		}
 	}
 	for id in to_remove {
 		m := g.reg[id]
@@ -1111,16 +1419,28 @@ reconcile :: proc() -> (added: int, removed: int) {
 
 		id := layout.Window_Id(g.next_id)
 		g.next_id += 1
+		// An AX-slow app's window is adopted "loose": it rides the strip as a
+		// full-viewport column (navigable, in the bar — in the ecosystem) but
+		// we stop polling it and only write to it on placement changes — also
+		// not. Games and Godot land here.
+		loose := mac.ax_pid_slow(w.pid)
 		g.reg[id] = Managed {
 			pid   = w.pid,
 			ax    = w.ax,
+			cgwin = w.cgwin,
 			title = w.title,
 			app   = w.app,
 			mon   = mi,
 			ws    = mon.focused_ws,
+			loose = loose,
 			orig  = to_rect(w.frame),
 		}
-		layout.append_window(&mon.workspaces[mon.focused_ws].strip, id) // new windows land on the right
+		strip := &mon.workspaces[mon.focused_ws].strip
+		if loose {
+			layout.append_window(strip, id, width_frac = 1.0) // whole screen
+		} else {
+			layout.append_window(strip, id) // new windows land on the right
+		}
 		added += 1
 	}
 	return
@@ -1202,15 +1522,24 @@ apply_monitor :: proc(b: ^strings.Builder, mi: int) {
 					mac.ax_set_minimized(m.ax, false)
 					set_hidden(p.id, false)
 				}
-				mac.set_frame(m.ax, to_cg(p.rect))
-				set_req_w(p.id, p.rect.w) // remember the asked-for width to detect clamping next tick
+				// All frame writes go to a writer thread (never block the tap),
+				// and only when the placement actually changed since our last one.
+				if m.placed != p.rect {
+					enqueue_frame(m.ax, p.rect, false, m.loose)
+					set_placed(p.id, p.rect)
+				}
+				if !m.loose do set_req_w(p.id, p.rect.w) // asked-for width, to detect clamping
 				applied = " -> on-screen"
 			} else {
 				// Hide off-view columns. Either park off-screen (instant, no genie
 				// animation) or minimize. Mark hidden so reconcile doesn't mistake
 				// the vanished-from-enumeration window for a closed one.
 				if g.hide_offscreen {
-					mac.set_frame(m.ax, to_cg(hidden_rect(p.rect, mon.viewport)), size_first = true)
+					hr := hidden_rect(p.rect, mon.viewport)
+					if m.placed != hr {
+						enqueue_frame(m.ax, hr, true, m.loose)
+						set_placed(p.id, hr)
+					}
 				} else {
 					mac.ax_set_minimized(m.ax, true)
 				}
@@ -1365,6 +1694,18 @@ refresh_settings :: proc() {
 		ign: c.int = (w.app in g.ignore_apps) ? 1 : 0
 		append(&rows, mac.WMSettingsRow{app = app_c, title = title_c, ignored = ign})
 	}
+	// The enumeration above skips AX-slow apps (Godot, games), but their
+	// windows are still managed via the slow lane — add those rows from the
+	// registry so they appear in the list too.
+	outer: for _, m in g.reg {
+		if !mac.ax_pid_slow(m.pid) do continue
+		for w in wins do if w.pid == m.pid do continue outer // both lanes raced; already listed
+		app_c := strings.clone_to_cstring(m.app)
+		title_c := strings.clone_to_cstring(m.title)
+		append(&cstrs, app_c, title_c)
+		ign: c.int = (m.app in g.ignore_apps) ? 1 : 0
+		append(&rows, mac.WMSettingsRow{app = app_c, title = title_c, ignored = ign})
+	}
 	mac.wm_settings_set_rows(raw_data(rows[:]), c.int(len(rows)))
 
 	cfg := fmt.aprintf(
@@ -1406,10 +1747,14 @@ update_focus_ring :: proc() {
 		mac.wm_ring_hide()
 		return
 	}
-	pos, p_ok := mac.ax_position(m.ax)
-	sz, s_ok := mac.ax_size(m.ax)
-	if p_ok && s_ok {
-		mac.wm_ring_show(f64(pos.x), f64(pos.y), f64(sz.width), f64(sz.height))
+	// Runs every fast tick (120ms). Draw the ring at the rect the effector last
+	// placed this window (m.placed) — a tiling WM owns the geometry, so this is
+	// authoritative, and reading it costs no AX. That keeps the tap-hosting main
+	// thread off every app's AX server (the polling here is what originally
+	// froze all input when a slow app like Godot was focused).
+	r := m.placed
+	if r.w > 0 && r.h > 0 {
+		mac.wm_ring_show(r.x, r.y, r.w, r.h)
 	} else {
 		mac.wm_ring_hide()
 	}
@@ -1471,6 +1816,15 @@ set_req_w :: proc(id: layout.Window_Id, w: f64) {
 	}
 }
 
+@(private = "file")
+set_placed :: proc(id: layout.Window_Id, r: layout.Rect) {
+	m, ok := g.reg[id]
+	if ok {
+		m.placed = r
+		g.reg[id] = m
+	}
+}
+
 // Detect width-constrained windows (those that won't grow to the width we asked
 // for, e.g. System Settings) and record their real width as the column's eff_w,
 // so compute_layout packs neighbours against it instead of the nominal slot.
@@ -1481,6 +1835,7 @@ learn_widths :: proc(s: ^layout.Strip) {
 		id := col.tiles[col.focused_tile].id
 		m, ok := g.reg[id]
 		if !ok || m.hidden || m.req_w <= 0 do continue // only on-screen, already-asked windows
+		if m.loose do continue // full-width by design; not worth an AX read to a slow app
 		sz, got := mac.ax_size(m.ax)
 		if !got do continue
 		actual := f64(sz.width)

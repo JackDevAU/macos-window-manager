@@ -67,14 +67,23 @@ foreign shim {
 focused_window :: proc() -> (AXUIElement, bool) {
 	pid := wm_frontmost_pid()
 	if pid <= 0 do return nil, false
+	// This runs on the fast focus tick; a frontmost app with a stalled AX
+	// server (a game) must be skipped, not re-queried into a blocked run loop.
+	if ax_pid_slow(pid) do return nil, false
 
-	app := AXUIElementCreateApplication(c.int(pid))
+	app := ax_app(pid)
 	defer CF.Release(CF.TypeRef(app))
 
 	// AXUIElementCopyAttributeValue returns a +1 reference, so the value we
-	// hand back is owned by the caller.
-	if v, ok := ax_get(app, "AXFocusedWindow"); ok do return AXUIElement(v), true
-	if v, ok := ax_get(app, "AXMainWindow"); ok do return AXUIElement(v), true
+	// hand back is owned by the caller. On a timeout, bail immediately —
+	// falling through would stack two more timed-out calls on this tick.
+	v, err := ax_get_err(app, "AXFocusedWindow")
+	if err == .Success do return AXUIElement(v), true
+	if err == .CannotComplete {
+		ax_mark_slow(pid)
+		return nil, false
+	}
+	if v2, ok := ax_get(app, "AXMainWindow"); ok do return AXUIElement(v2), true
 	return first_window(pid)
 }
 
