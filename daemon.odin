@@ -40,10 +40,12 @@ Workspace :: struct {
 // always laid out — unlike workspaces, where only the focused one shows.
 Monitor :: struct {
 	display_id: u32,
+	bounds:     layout.Rect, // full CGDisplayBounds at build time (staleness check)
 	viewport:   layout.Rect, // this display's usable area (below its bar)
 	bar_rect:   layout.Rect, // status bar strip across the top of this display
 	workspaces: [dynamic]Workspace,
 	focused_ws: int,
+	live:       bool, // per-monitor tiling: false = freeform (windows left where they are)
 }
 
 Layout_Mode :: enum {
@@ -236,7 +238,7 @@ run_daemon :: proc(manage_app: string = "") {
 	fmt.printfln("niri-mac daemon listening on %s", SOCKET_PATH)
 	fmt.printfln("  managing %s, TILING (use `wm live off` or Alt+T to pause)", scope)
 	if g_tap != nil && input_ok {
-		fmt.println("  hotkeys: ENABLED (Alt+hjkl focus, r=width m=maximize g=grid/columns f=float ,/.=consume/expel Alt+Shift+,=group 1-9=focus, Ctrl+1-9=workspace, t=tiling; Cmd+Tab is native)")
+		fmt.println("  hotkeys: ENABLED (Alt+hjkl focus, r=width m=maximize g=grid/columns f=float ,/.=consume/expel Alt+Shift+,=group 1-9=focus, Ctrl+1-9=workspace, t=tiling this monitor; Cmd+Tab is native)")
 	} else {
 		fmt.println("  hotkeys: NOT ACTIVE — grant Input Monitoring to your terminal in")
 		fmt.println("           System Settings > Privacy & Security > Input Monitoring, then restart the daemon")
@@ -293,8 +295,12 @@ build_monitors :: proc() {
 		vf := mac.visible_frame(id)
 		full := layout.Rect{f64(vf.origin.x), f64(vf.origin.y), f64(vf.size.width), f64(vf.size.height)}
 
+		b := mac.CGDisplayBounds(id)
+
 		mon: Monitor
 		mon.display_id = id
+		mon.bounds = {f64(b.origin.x), f64(b.origin.y), f64(b.size.width), f64(b.size.height)}
+		mon.live = true // tiling on by default; Alt+T toggles this monitor
 		mon.bar_rect = {full.x, full.y, full.w, BAR_H} // each display gets a bar across its top
 		mon.viewport = {full.x, full.y + BAR_H, full.w, full.h - BAR_H} // windows tile below it
 		mon.workspaces = make([dynamic]Workspace)
@@ -306,6 +312,28 @@ build_monitors :: proc() {
 
 	g.focused_monitor = 0
 	for m, i in g.monitors do if m.display_id == main do g.focused_monitor = i
+}
+
+// True when the active display set no longer matches g.monitors: a display was
+// added/removed/swapped (id not found) or changed resolution/arrangement
+// (CGDisplayBounds differs from build time). Compares bounds, not visibleFrame,
+// so transient menu-bar hides (fullscreen spaces) don't trigger churn.
+@(private = "file")
+monitors_stale :: proc(ids: []u32) -> bool {
+	if len(ids) != len(g.monitors) do return true
+	for id in ids {
+		b := mac.CGDisplayBounds(id)
+		cur := layout.Rect{f64(b.origin.x), f64(b.origin.y), f64(b.size.width), f64(b.size.height)}
+		found := false
+		for mon in g.monitors {
+			if mon.display_id == id {
+				found = mon.bounds == cur
+				break
+			}
+		}
+		if !found do return true
+	}
+	return false
 }
 
 @(private = "file")
@@ -476,13 +504,14 @@ socket_cb :: proc "c" (f: mac.CFFileDescriptor, types: u64, info: rawptr) {
 @(private = "file")
 timer_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 	context = runtime.default_context()
-	// Display hotplug: if the number of active displays changed, rebuild the
-	// monitors and re-adopt windows from scratch so nothing is stranded on a
-	// monitor that no longer exists (which would otherwise be an out-of-range mon).
+	// Display hotplug: if the active display set or any display's geometry no
+	// longer matches what build_monitors captured (unplug, swap, resolution
+	// change), rebuild the monitors and re-adopt windows from scratch so nothing
+	// is tiled into a stale viewport (e.g. under the bar, or off-screen).
 	buf: [16]u32
-	n_displays := len(mac.active_displays(buf[:]))
-	if n_displays == 0 do return // lid closed / displays asleep: rebuilding now would leave zero monitors and crash cur_mon; wait for wake
-	if n_displays != len(g.monitors) {
+	ids := mac.active_displays(buf[:])
+	if len(ids) == 0 do return // lid closed / displays asleep: rebuilding now would leave zero monitors and crash cur_mon; wait for wake
+	if monitors_stale(ids) {
 		full_resync()
 		if g.live do run_effector(nil)
 		mac.wm_bar_status_refresh()
@@ -503,6 +532,7 @@ timer_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 @(private = "file")
 focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 	context = runtime.default_context()
+	if len(g.monitors) == 0 do return // displays asleep/mid-reconfigure: cur_strip would crash; timer_cb rebuilds on wake
 
 	// A slow window the user paused on: once the dwell passes and focus is still
 	// there, raise/activate it (deferred from raise_focused). If focus has moved
@@ -732,7 +762,9 @@ dispatch_hotkey :: proc(keycode: i64, flags: u64) -> bool {
 	case KEY_PERIOD:
 		layout.expel_from_column(cur_strip())
 	case KEY_T:
-		set_live(!g.live)
+		// Alt+T toggles tiling for the FOCUSED monitor only (per-monitor);
+		// the global master stays on `wm live` / the settings toggle.
+		set_monitor_live(g.focused_monitor, !g.monitors[g.focused_monitor].live)
 	case:
 		if n, is_digit := digit_for_keycode(keycode); is_digit {
 			if shift do move_focused_to_slot(n)
@@ -868,6 +900,18 @@ daemon_handle :: proc(cmd: string) -> (string, bool) {
 			set_live(false)
 		}
 		fmt.sbprintfln(&b, "effector: %s", g.live ? "LIVE" : "dry-run")
+		render_state(&b)
+	case "monitor-tiling":
+		// Per-monitor tiling for the focused monitor (same as Alt+T).
+		// `monitor-tiling on|off|toggle` (default toggle).
+		mi := g.focused_monitor
+		cur := g.monitors[mi].live
+		on := !cur
+		if len(parts) > 1 && parts[1] == "on" do on = true
+		else if len(parts) > 1 && parts[1] == "off" do on = false
+		set_monitor_live(mi, on)
+		if g.live do run_effector(nil)
+		fmt.sbprintfln(&b, "monitor %d tiling: %s", mi + 1, g.monitors[mi].live ? "on" : "manual")
 		render_state(&b)
 	case "mode":
 		if len(parts) > 1 && parts[1] == "columns" {
@@ -1324,6 +1368,7 @@ should_tile :: proc(w: mac.Std_Window) -> bool {
 
 @(private = "file")
 reconcile :: proc() -> (added: int, removed: int, retagged: int) {
+	if len(g.monitors) == 0 do return // no displays to home windows on; timer_cb rebuilds on wake
 	wins := mac.standard_windows(g.manage_app)
 	defer delete(wins)
 
@@ -1455,7 +1500,8 @@ render_state :: proc(b: ^strings.Builder) {
 	for mon, mi in g.monitors {
 		s := &mon.workspaces[mon.focused_ws].strip
 		marker := mi == g.focused_monitor ? "*" : " "
-		fmt.sbprintfln(b, "%smonitor %d (display %d, ws %d/%d):", marker, mi + 1, mon.display_id, mon.focused_ws, len(mon.workspaces) - 1)
+		tiling := mon.live ? "tiling" : "manual"
+		fmt.sbprintfln(b, "%smonitor %d (display %d, ws %d/%d, %s):", marker, mi + 1, mon.display_id, mon.focused_ws, len(mon.workspaces) - 1, tiling)
 		if len(s.columns) == 0 do fmt.sbprintln(b, "  (focused workspace empty)")
 		for col, ci in s.columns {
 			fmt.sbprintf(b, ci == s.focused_col ? "  > col%d w=%.2f:" : "    col%d w=%.2f:", ci, col.width_frac)
@@ -1502,8 +1548,12 @@ run_effector :: proc(b: ^strings.Builder) {
 @(private = "file")
 apply_monitor :: proc(b: ^strings.Builder, mi: int) {
 	mon := &g.monitors[mi]
+	// Effective tiling for this monitor: the global master AND this monitor's own
+	// switch. A monitor with live=false is freeform — its windows are left where
+	// they are, so one screen can tile while another stays manual.
+	live := g.live && mon.live
 	s := &mon.workspaces[mon.focused_ws].strip
-	if g.live && g.mode == .Columns do learn_widths(s)
+	if live && g.mode == .Columns do learn_widths(s)
 	ps: []layout.Placement
 	switch g.mode {
 	case .Grid:    ps = layout.compute_grid(s, mon.viewport)
@@ -1516,7 +1566,7 @@ apply_monitor :: proc(b: ^strings.Builder, mi: int) {
 	for p in ps {
 		m := g.reg[p.id]
 		applied := ""
-		if g.live {
+		if live {
 			if p.visible {
 				if m.hidden {
 					mac.ax_set_minimized(m.ax, false)
@@ -1558,7 +1608,7 @@ apply_monitor :: proc(b: ^strings.Builder, mi: int) {
 		}
 	}
 
-	if g.live {
+	if live {
 		for ws, wi in mon.workspaces {
 			if wi == mon.focused_ws do continue
 			for col in ws.strip.columns {
@@ -1612,7 +1662,10 @@ set_monitor_bar :: proc(mi: int) {
 	}
 	status_c := strings.clone_to_cstring(status)
 	delete(status)
-	mode_c := strings.clone_to_cstring(g.live ? "tiling" : "dry-run")
+	// Per-monitor tiling state: global-off shows dry-run everywhere; otherwise
+	// each bar shows whether ITS monitor is tiling or freeform ("manual").
+	tiling_label := !g.live ? "dry-run" : (mon.live ? "tiling" : "manual")
+	mode_c := strings.clone_to_cstring(tiling_label)
 	append(&cstrs, status_c, mode_c)
 	append(&segs, mac.WMBarSeg{app = status_c, title = mode_c, window_id = mac.WM_BAR_NONE})
 
@@ -1737,6 +1790,10 @@ clip :: proc(s: string, n: int) -> string {
 // gives visible feedback even in dry-run (where windows aren't moved).
 @(private = "file")
 update_focus_ring :: proc() {
+	if len(g.monitors) == 0 {
+		mac.wm_ring_hide()
+		return
+	}
 	fid, has := layout.focused_window(cur_strip())
 	if !has {
 		mac.wm_ring_hide()
@@ -1796,6 +1853,40 @@ restore_all :: proc() {
 set_live :: proc(on: bool) {
 	if g.live && !on do restore_all()
 	g.live = on
+}
+
+// Restore just monitor `mi`'s managed windows to where they were before tiling
+// (un-hide off-view ones, move each back to its original frame) — via the writer
+// thread so a loose app never blocks. Used when a single monitor leaves tiling.
+@(private = "file")
+restore_monitor :: proc(mi: int) {
+	mon := &g.monitors[mi]
+	for ws in mon.workspaces {
+		for col in ws.strip.columns {
+			for tile in col.tiles {
+				m, ok := g.reg[tile.id]
+				if !ok do continue
+				if m.hidden && !g.hide_offscreen {
+					mac.ax_set_minimized(m.ax, false) // undo a real minimize
+				}
+				enqueue_frame(m.ax, m.orig, false, m.loose)
+				set_placed(tile.id, m.orig)
+				set_hidden(tile.id, false)
+			}
+		}
+	}
+}
+
+// Per-monitor tiling toggle: lets one screen tile while another stays freeform.
+// Turning a monitor off restores its windows; turning it on re-tiles on the next
+// run_effector (the hotkey tail runs one).
+@(private = "file")
+set_monitor_live :: proc(mi: int, on: bool) {
+	if mi < 0 || mi >= len(g.monitors) do return
+	mon := &g.monitors[mi]
+	if mon.live == on do return
+	if mon.live && !on do restore_monitor(mi)
+	mon.live = on
 }
 
 @(private = "file")

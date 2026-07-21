@@ -92,7 +92,7 @@ main :: proc() {
 		fmt.println("posted Alt+L")
 	case "kill":
 		cmd_kill()
-	case "ping", "sync", "state", "live", "stop",
+	case "ping", "sync", "state", "live", "monitor-tiling", "stop",
 	     "focus-left", "focus-right", "focus-up", "focus-down",
 	     "move-left", "move-right", "width", "width-max", "consume", "expel",
 	     "windows", "focus-window",
