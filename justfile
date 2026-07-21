@@ -20,9 +20,10 @@ shim:
 check: shim
     odin check .
 
-# Run the pure layout unit tests
-test:
+# Run the unit tests (pure layout engine + daemon tick decisions)
+test: shim
     odin test layout
+    odin test .
 
 # Remove build artifacts
 clean:

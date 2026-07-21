@@ -23,7 +23,7 @@ Managed :: struct {
 	app:     string, // allocated (owning app name)
 	mon:     int, // which monitor (index into g.monitors) this window tiles on
 	ws:      int, // workspace within that monitor
-	hidden:  bool, // hidden by us (so reconcile won't mistake it for closed)
+	hidden:  Hidden, // hidden by us, and how (parked stays enumerable; minimized doesn't)
 	floated: bool, // user-excluded from tiling (Alt+F) — left where it is
 	loose:   bool, // AX-slow app (a game): full-screen column, minimal AX traffic
 	req_w:   f64, // width we last asked this window to be (to detect clamping)
@@ -112,6 +112,48 @@ g_activating_until: mac.CFAbsoluteTime
 g_pending_raise_id: layout.Window_Id
 @(private = "file")
 g_pending_raise_at: mac.CFAbsoluteTime
+
+// How (whether) we've hidden a window. Parked windows keep a 6px on-screen
+// peek, so they stay in the on-screen enumeration; minimized ones drop out.
+Hidden :: enum {
+	None,
+	Parked, // slid off-view (hide_offscreen mode): still enumerable
+	Minimized, // truly minimized: absent from the on-screen enumeration
+}
+
+// --- pure tick decisions (unit-tested in daemon_test.odin) -------------------
+
+// A managed window absent from this tick's enumeration: is it really closed?
+// A dead pid settles it — the app is gone, so is the window. A window WE
+// minimized is expected to be absent (its app may have nothing left on screen
+// to be enumerated through), so absence proves nothing while the app lives.
+// A parked window is still on-screen by design, so it enumerates like a
+// visible one: absent means closed — except for a slow (AX-backed-off) pid,
+// which the fast lane skips; only a tick whose slow-lane batch covered that
+// pid carries enough truth.
+absent_window_closed :: proc(hidden: Hidden, pid_alive, pid_slow, pid_in_slow_batch: bool) -> bool {
+	if !pid_alive do return true
+	if hidden == .Minimized do return false
+	return !pid_slow || pid_in_slow_batch
+}
+
+// What the fast tick should do about a deferred (loose-window) raise.
+Pending_Raise :: enum {
+	Waiting, // focus still on it, dwell not yet elapsed — keep waiting
+	Raise,   // focus dwelt on it long enough — raise/activate now
+	Drop,    // focus moved on before it settled — never activate it
+}
+
+pending_raise_tick :: proc(pending, focused: layout.Window_Id, has_focused: bool, now, due: mac.CFAbsoluteTime) -> Pending_Raise {
+	if !has_focused || focused != pending do return .Drop
+	return now >= due ? .Raise : .Waiting
+}
+
+// While a window we activated is still coming frontmost, the OS-focus-follow
+// tick is suppressed; the guard lifts once the pid is frontmost or we time out.
+activation_guard_done :: proc(guard_pid, frontmost_pid: i32, now, deadline: mac.CFAbsoluteTime) -> bool {
+	return frontmost_pid == guard_pid || now >= deadline
+}
 
 FOCUS_HOLD_TICKS :: 3
 CLICK_SYNC_TICKS :: 4
@@ -538,24 +580,24 @@ focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 	// there, raise/activate it (deferred from raise_focused). If focus has moved
 	// on (spam-navigated past), just drop it — we never activate it.
 	if g_pending_raise_id != 0 {
-		if cur, has := layout.focused_window(cur_strip()); has && cur == g_pending_raise_id {
-			if mac.CFAbsoluteTimeGetCurrent() >= g_pending_raise_at {
-				if m, ok := g.reg[g_pending_raise_id]; ok {
-					enqueue_focus(m.ax, m.pid, true)
-					arm_activation_guard(m.pid)
-				}
-				g_pending_raise_id = 0
+		cur, has := layout.focused_window(cur_strip())
+		switch pending_raise_tick(g_pending_raise_id, cur, has, mac.CFAbsoluteTimeGetCurrent(), g_pending_raise_at) {
+		case .Raise:
+			if m, ok := g.reg[g_pending_raise_id]; ok {
+				enqueue_focus(m.ax, m.pid, true)
+				arm_activation_guard(m.pid)
 			}
-		} else {
+			g_pending_raise_id = 0
+		case .Drop:
 			g_pending_raise_id = 0 // focus left before it settled — skip it
+		case .Waiting:
 		}
 	}
 
 	// While a window we activated is still coming frontmost, don't let the
 	// OS-focus-follow below bounce us back to whatever is frontmost right now.
 	if g_activating_pid != 0 {
-		fp := mac.wm_frontmost_pid()
-		if fp == g_activating_pid || mac.CFAbsoluteTimeGetCurrent() >= g_activating_until {
+		if activation_guard_done(g_activating_pid, mac.wm_frontmost_pid(), mac.CFAbsoluteTimeGetCurrent(), g_activating_until) {
 			g_activating_pid = 0
 		} else {
 			update_focus_ring()
@@ -1252,10 +1294,10 @@ toggle_float_focused :: proc() {
 		g.reg[id] = m
 		layout.remove_window(cur_strip(), id)
 		run_effector(nil)
-		if m.hidden {
+		if m.hidden == .Minimized {
 			mac.ax_set_minimized(m.ax, false)
-			set_hidden(id, false)
 		}
+		set_hidden(id, .None)
 		// Centre + raise so it's draggable immediately — via the writer thread
 		// (loose apps must never take a synchronous AX call on the tap thread).
 		centre := layout.apply_preset(cur_mon().viewport, .Center)
@@ -1422,14 +1464,12 @@ reconcile :: proc() -> (added: int, removed: int, retagged: int) {
 			g.reg[id] = mm
 			retagged += 1
 		}
-		// A window we minimized drops out of the on-screen enumeration; don't
-		// mistake that for the user closing it. Same for an app in AX-timeout
-		// backoff — the fast lane skips it, so its windows are absent, not
-		// gone; trust an absence only when this tick's slow-lane batch
-		// actually covered that pid (otherwise ghosts of closed windows — or
-		// Godot children we stopped tracking — would linger forever).
-		if !found && !m.hidden {
-			if !mac.ax_pid_slow(m.pid) || m.pid in slow_batch_pids {
+		// Absent from this tick's scan: closed, or just invisible to it?
+		// absent_window_closed has the full rules; the liveness probe is a
+		// free syscall (signal 0), no AX.
+		if !found {
+			alive := posix.kill(posix.pid_t(m.pid), .NONE) == .OK
+			if absent_window_closed(m.hidden, alive, mac.ax_pid_slow(m.pid), m.pid in slow_batch_pids) {
 				append(&to_remove, id)
 			}
 		}
@@ -1562,16 +1602,24 @@ apply_monitor :: proc(b: ^strings.Builder, mi: int) {
 	}
 	defer delete(ps)
 
+	// Which edges of this monitor face empty space (for parking off-view windows).
+	other_bounds := make([dynamic]layout.Rect, 0, len(g.monitors))
+	defer delete(other_bounds)
+	for m2, j in g.monitors do if j != mi do append(&other_bounds, m2.bounds)
+	open_left, open_right := open_park_sides(mon.bounds, other_bounds[:])
+
 	if b != nil do fmt.sbprintfln(b, "monitor %d (display %d) view_x=%.0f", mi + 1, mon.display_id, s.view_x)
 	for p in ps {
 		m := g.reg[p.id]
 		applied := ""
 		if live {
 			if p.visible {
-				if m.hidden {
+				// Only a real minimize needs the synchronous AX undo; a parked
+				// window just gets its on-view frame back below.
+				if m.hidden == .Minimized {
 					mac.ax_set_minimized(m.ax, false)
-					set_hidden(p.id, false)
 				}
+				set_hidden(p.id, .None)
 				// All frame writes go to a writer thread (never block the tap),
 				// and only when the placement actually changed since our last one.
 				if m.placed != p.rect {
@@ -1585,15 +1633,16 @@ apply_monitor :: proc(b: ^strings.Builder, mi: int) {
 				// animation) or minimize. Mark hidden so reconcile doesn't mistake
 				// the vanished-from-enumeration window for a closed one.
 				if g.hide_offscreen {
-					hr := hidden_rect(p.rect, mon.viewport)
+					hr := park_rect(p.rect, mon.viewport, mon.bounds, open_left, open_right)
 					if m.placed != hr {
 						enqueue_frame(m.ax, hr, true, m.loose)
 						set_placed(p.id, hr)
 					}
+					set_hidden(p.id, .Parked)
 				} else {
 					mac.ax_set_minimized(m.ax, true)
+					set_hidden(p.id, .Minimized)
 				}
-				set_hidden(p.id, true)
 				applied = g.hide_offscreen ? " -> off-screen" : " -> minimized"
 			}
 		}
@@ -1613,8 +1662,14 @@ apply_monitor :: proc(b: ^strings.Builder, mi: int) {
 			if wi == mon.focused_ws do continue
 			for col in ws.strip.columns {
 				for tile in col.tiles {
+					// Already down: skip the synchronous AX re-minimize this
+					// loop used to pay per off-workspace window on EVERY
+					// effector pass (i.e. every navigation hotkey). If the
+					// user summons it externally (Dock), it becomes frontmost
+					// and the focus-follow tick switches to its workspace.
+					if g.reg[tile.id].hidden == .Minimized do continue
 					mac.ax_set_minimized(g.reg[tile.id].ax, true)
-					set_hidden(tile.id, true)
+					set_hidden(tile.id, .Minimized)
 				}
 			}
 		}
@@ -1819,19 +1874,32 @@ update_focus_ring :: proc() {
 
 EDGE_REVEAL :: 6.0
 
-// Where to park an off-view window: push it down past its OWN monitor's bottom
-// edge, leaving EDGE_REVEAL px peeking. Keeping part on-screen means macOS won't
-// clamp it and it stays in the window list (no eviction) — how Hiro/OmniWM hides.
-//
-// Parking *down* (not left/right) is what keeps it off the neighbouring monitor:
-// sliding a window off the left/right edge slides it straight onto a
-// horizontally-adjacent display. x stays within this monitor, so the only place
-// it can peek is this monitor's own bottom — invisible to the other screen.
-// (Assumes a horizontal display arrangement, the common case; a display stacked
-// directly below would still see the peek.)
-@(private = "file")
-hidden_rect :: proc(r: layout.Rect, v: layout.Rect) -> layout.Rect {
-	return {r.x, v.y + v.h - EDGE_REVEAL, r.w, r.h}
+// Which sides of monitor `mon` face empty space — no other display overlaps
+// its vertical band on that side. A side-parked window keeps its own y, so
+// only displays sharing this monitor's y-range can see it. Bounds are full
+// CGDisplayBounds rects.
+open_park_sides :: proc(mon: layout.Rect, others: []layout.Rect) -> (left, right: bool) {
+	left, right = true, true
+	for b in others {
+		if b.y + b.h <= mon.y || b.y >= mon.y + mon.h do continue // no vertical overlap
+		if b.x < mon.x do left = false
+		if b.x > mon.x do right = false
+	}
+	return
+}
+
+// Where to park an off-view window so it's (nearly) invisible. macOS clamps a
+// window parked DOWN so its whole title bar stays on screen — that's a full
+// tab-bar strip peeking along the bottom, not the EDGE_REVEAL sliver we asked
+// for. Horizontal placement isn't clamped that way, so prefer sliding the
+// window off an OPEN side edge (past the display bounds), keeping EDGE_REVEAL
+// px on-screen — fully off-screen would drop it from the on-screen window
+// list and reconcile would mistake it for closed. A monitor boxed in on both
+// sides falls back to bottom parking and accepts the title-bar peek.
+park_rect :: proc(r, vp, bounds: layout.Rect, open_left, open_right: bool) -> layout.Rect {
+	if open_right do return {bounds.x + bounds.w - EDGE_REVEAL, r.y, r.w, r.h}
+	if open_left do return {bounds.x - r.w + EDGE_REVEAL, r.y, r.w, r.h}
+	return {r.x, vp.y + vp.h - EDGE_REVEAL, r.w, r.h}
 }
 
 // Restore every managed window to the frame it had when first managed, so
@@ -1845,7 +1913,7 @@ restore_all :: proc() {
 		mac.set_frame(m.ax, to_cg(m.orig))
 		append(&ids, id)
 	}
-	for id in ids do set_hidden(id, false)
+	for id in ids do set_hidden(id, .None)
 }
 
 // Toggle the effector. Turning it off restores all managed windows.
@@ -1866,12 +1934,12 @@ restore_monitor :: proc(mi: int) {
 			for tile in col.tiles {
 				m, ok := g.reg[tile.id]
 				if !ok do continue
-				if m.hidden && !g.hide_offscreen {
+				if m.hidden == .Minimized {
 					mac.ax_set_minimized(m.ax, false) // undo a real minimize
 				}
 				enqueue_frame(m.ax, m.orig, false, m.loose)
 				set_placed(tile.id, m.orig)
-				set_hidden(tile.id, false)
+				set_hidden(tile.id, .None)
 			}
 		}
 	}
@@ -1890,7 +1958,7 @@ set_monitor_live :: proc(mi: int, on: bool) {
 }
 
 @(private = "file")
-set_hidden :: proc(id: layout.Window_Id, hidden: bool) {
+set_hidden :: proc(id: layout.Window_Id, hidden: Hidden) {
 	m, ok := g.reg[id]
 	if ok && m.hidden != hidden {
 		m.hidden = hidden
@@ -1925,7 +1993,7 @@ learn_widths :: proc(s: ^layout.Strip) {
 		if len(col.tiles) == 0 do continue
 		id := col.tiles[col.focused_tile].id
 		m, ok := g.reg[id]
-		if !ok || m.hidden || m.req_w <= 0 do continue // only on-screen, already-asked windows
+		if !ok || m.hidden != .None || m.req_w <= 0 do continue // only on-screen, already-asked windows
 		if m.loose do continue // full-width by design; not worth an AX read to a slow app
 		sz, got := mac.ax_size(m.ax)
 		if !got do continue

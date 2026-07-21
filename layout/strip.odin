@@ -369,6 +369,10 @@ compute_layout :: proc(s: ^Strip, viewport: Rect, allocator := context.allocator
 	f_right := xs[f] + widths[f]
 	if f_left < s.view_x do s.view_x = f_left
 	if f_right > s.view_x + content_w do s.view_x = f_right - content_w
+	// Never overscroll past the content's right edge (e.g. after closing the
+	// rightmost column) — that strands columns off-left beside dead space.
+	max_view := cursor - gap - content_w
+	if s.view_x > max_view do s.view_x = max_view
 	if s.view_x < 0 do s.view_x = 0
 
 	left_edge := viewport.x + gap

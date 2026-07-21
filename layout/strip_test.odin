@@ -203,6 +203,50 @@ test_consume_and_expel :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.focused_col, 1)
 }
 
+// --- navigation baseline (bug repros) ----------------------------------------
+
+@(test)
+test_remove_focused_middle_column_focuses_right_neighbor :: proc(t: ^testing.T) {
+	s := make_strip()
+	defer strip_destroy(&s)
+	add_window(&s, 1)
+	add_window(&s, 2)
+	add_window(&s, 3)
+	focus_left(&s) // focus col1 (id 2)
+
+	remove_window(&s, 2)
+	testing.expect_value(t, len(s.columns), 2)
+	id, has := focused_window(&s)
+	testing.expect(t, has)
+	testing.expect_value(t, id, Window_Id(3)) // focus lands on the right neighbor
+}
+
+@(test)
+test_remove_rightmost_clamps_view_to_content :: proc(t: ^testing.T) {
+	// Close the rightmost window while scrolled right: the view must clamp
+	// back to the content's right edge — no dead space, no neighbour left
+	// stranded off-screen.
+	s := make_strip(0)
+	defer strip_destroy(&s)
+	add_window(&s, 1, 0.5)
+	add_window(&s, 2, 0.5)
+	add_window(&s, 3, 0.5)
+	ps0 := compute_layout(&s, VP) // settle the scroll: view_x=500
+	delete(ps0)
+	testing.expect(t, near(s.view_x, 500))
+
+	remove_window(&s, 3)
+	ps := compute_layout(&s, VP)
+	defer delete(ps)
+
+	testing.expect(t, near(s.view_x, 0))
+	p1, _ := find(ps, 1)
+	p2, _ := find(ps, 2)
+	testing.expect(t, p1.visible && p2.visible)
+	testing.expect_value(t, p1.rect.x, 0)
+	testing.expect_value(t, p2.rect.x, 500)
+}
+
 // --- layout ----------------------------------------------------------------
 
 VP :: Rect{0, 0, 1000, 1000}
