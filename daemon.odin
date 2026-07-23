@@ -113,6 +113,25 @@ g_pending_raise_id: layout.Window_Id
 @(private = "file")
 g_pending_raise_at: mac.CFAbsoluteTime
 
+// The last window we enqueued a real focus write for, and — when a newer raise
+// superseded a slow (loose) one that hadn't come frontmost yet — the superseded
+// window. A slow app's activation can land ~1s after we asked; if the OS then
+// reports THAT window frontmost, it's our own late write, not the user
+// switching ("move past Godot, it drags you back"). The follow tick re-asserts
+// instead of following, until the marker expires.
+@(private = "file")
+g_issued_raise_id: layout.Window_Id
+@(private = "file")
+g_stale_raise_id: layout.Window_Id
+@(private = "file")
+g_stale_raise_until: mac.CFAbsoluteTime
+
+// A frontmost change seen for one tick, awaiting its confirming second tick.
+// A one-tick blip (Outlook self-activating for a reminder while AX-flagged
+// slow) must never yank focus; a real switch (Cmd+Tab, Dock) persists.
+@(private = "file")
+g_follow_candidate: layout.Window_Id
+
 // How (whether) we've hidden a window. Parked windows keep a 6px on-screen
 // peek, so they stay in the on-screen enumeration; minimized ones drop out.
 Hidden :: enum {
@@ -124,15 +143,26 @@ Hidden :: enum {
 // --- pure tick decisions (unit-tested in daemon_test.odin) -------------------
 
 // A managed window absent from this tick's enumeration: is it really closed?
-// A dead pid settles it — the app is gone, so is the window. A window WE
-// minimized is expected to be absent (its app may have nothing left on screen
-// to be enumerated through), so absence proves nothing while the app lives.
-// A parked window is still on-screen by design, so it enumerates like a
-// visible one: absent means closed — except for a slow (AX-backed-off) pid,
-// which the fast lane skips; only a tick whose slow-lane batch covered that
-// pid carries enough truth.
-absent_window_closed :: proc(hidden: Hidden, pid_alive, pid_slow, pid_in_slow_batch: bool) -> bool {
+// A dead pid settles it — the app is gone, so is the window. Otherwise the
+// window's own AX element is ground truth: probing it (ax_window_alive) answers
+// .InvalidUIElement the instant it's gone, yet .Success for a window merely on
+// another Space / hidden / minimized. That distinction is why the on-screen
+// enumeration alone can't decide: it's Space-local, so a fullscreen app, a
+// Space switch, or Cmd+H drops every managed window from it at once — reading
+// that as "closed" mass-removed them, then re-adoption scattered them across
+// monitors and stole focus.
+//
+// AX can be inconclusive (`!ax_decided`) for an AX-backed-off (slow) app, whose
+// element we won't block on. Then fall back: the window server's FULL list
+// (cg_listed) still knows an off-Space window exists — but it also KEEPS a
+// closed off-screen (parked) window's id around a while, so it can only clear a
+// slow app's window, never confirm one closed here; a window WE minimized is
+// expected to be absent while its app lives; a parked/visible window without a
+// CGWindowID rides the slow-lane batch (only a tick that covered its pid knows).
+absent_window_closed :: proc(hidden: Hidden, pid_alive, pid_slow, pid_in_slow_batch: bool, cg_known, cg_listed: bool, ax_alive, ax_decided: bool) -> bool {
 	if !pid_alive do return true
+	if ax_decided do return !ax_alive // the element itself: alive means on another Space / hidden, not closed
+	if cg_known do return !cg_listed
 	if hidden == .Minimized do return false
 	return !pid_slow || pid_in_slow_batch
 }
@@ -153,6 +183,45 @@ pending_raise_tick :: proc(pending, focused: layout.Window_Id, has_focused: bool
 // tick is suppressed; the guard lifts once the pid is frontmost or we time out.
 activation_guard_done :: proc(guard_pid, frontmost_pid: i32, now, deadline: mac.CFAbsoluteTime) -> bool {
 	return frontmost_pid == guard_pid || now >= deadline
+}
+
+// What the follow tick should do about the OS-frontmost managed window.
+Follow_Action :: enum {
+	Ignore, // nothing managed frontmost, or no change since last sync
+	Record, // frontmost is already the daemon's focus — just remember it
+	Arm, // frontmost changed this tick — confirm on the next before acting
+	Follow, // confirmed external switch (Cmd+Tab, Dock, Raycast) — adopt it
+	Reassert, // our superseded slow raise landed late — put focus back on ours
+}
+
+follow_action :: proc(frontmost, last_synced, cur_focused: layout.Window_Id, has_cur: bool, stale: layout.Window_Id, stale_active: bool, candidate: layout.Window_Id) -> Follow_Action {
+	if frontmost == 0 do return .Ignore
+	if frontmost == last_synced do return .Ignore
+	if has_cur && frontmost == cur_focused do return .Record
+	if stale_active && frontmost == stale do return .Reassert
+	if frontmost != candidate do return .Arm
+	return .Follow
+}
+
+// What a post-click sync tick should do about the OS-frontmost managed window.
+Click_Sync_Action :: enum {
+	Wait, // nothing managed frontmost, or still the pre-click window — keep waiting
+	Arm, // a new window came frontmost — confirm on the next tick before syncing
+	Sync, // held frontmost two consecutive ticks: this is the click's target
+}
+
+click_sync_action :: proc(frontmost, cur_focused: layout.Window_Id, has_cur: bool, candidate: layout.Window_Id) -> Click_Sync_Action {
+	if frontmost == 0 do return .Wait
+	if has_cur && frontmost == cur_focused do return .Wait
+	return frontmost == candidate ? .Sync : .Arm
+}
+
+// Issuing a raise for `new` supersedes the previous one. The old write can only
+// land late (and steal focus back) if it went to the slow queue (a loose
+// window) and its app hadn't come frontmost yet when it was superseded — a
+// fast-queue write is either replaced in-queue or lands in milliseconds.
+raise_superseded_late :: proc(prev, new: layout.Window_Id, prev_loose, prev_arrived: bool) -> bool {
+	return prev != 0 && prev != new && prev_loose && !prev_arrived
 }
 
 FOCUS_HOLD_TICKS :: 3
@@ -222,6 +291,7 @@ run_daemon :: proc(manage_app: string = "") {
 
 	g.reg = make(map[layout.Window_Id]Managed)
 	g.ignore_apps = make(map[string]bool)
+	g.next_id = 1 // id 0 is the "no window" sentinel throughout this file
 	build_monitors() // one independent tiling area per physical display
 	g.live = true // start tiling immediately (use `wm live off` / Alt+T to pause)
 	g.manage_app = manage_app
@@ -287,7 +357,7 @@ run_daemon :: proc(manage_app: string = "") {
 	}
 
 	// Adopt and tile the current windows immediately, before entering the loop.
-	reconcile()
+	reconcile(home_new_at_frame = true)
 	run_effector(nil)
 
 	// Run the AppKit event loop (not a bare CFRunLoopRun) so the settings window's
@@ -584,6 +654,7 @@ focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 		switch pending_raise_tick(g_pending_raise_id, cur, has, mac.CFAbsoluteTimeGetCurrent(), g_pending_raise_at) {
 		case .Raise:
 			if m, ok := g.reg[g_pending_raise_id]; ok {
+				note_raise_issued(g_pending_raise_id)
 				enqueue_focus(m.ax, m.pid, true)
 				arm_activation_guard(m.pid)
 			}
@@ -613,23 +684,38 @@ focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 		g_click_sync -= 1
 		if sync_focus_from_os() { // matched the clicked window into the strip
 			g_click_sync = 0
-			update_bar() // re-highlight the focused segment
+			// The clicked window may live on another workspace/monitor: the sync
+			// switched daemon focus there, but only the effector un-hides that
+			// workspace and re-parks the old one. It also refreshes ring + bar;
+			// on a plain same-workspace click nothing moved, so it's just that.
+			run_effector(nil)
 		}
 	} else {
 		// Follow the OS focus: native Cmd+Tab, Raycast, Spotlight, the Dock — any
 		// activation of a window we manage. Acts only when the frontmost window
-		// *changes* and isn't already our focus, so it never fights hotkey nav
-		// (which is further guarded by g_focus_hold above). This is what makes a
-		// "jump to a window" land even when we'd hidden it (other workspace / off
-		// view): run_effector un-hides and re-tiles it.
-		if id, ok := frontmost_managed(); ok && id != g_last_synced_id {
+		// *changes*, holds steady for two ticks (a self-activating app's blip is
+		// not a switch), and isn't a stale raise of our own landing late — so it
+		// never fights hotkey nav (further guarded by g_focus_hold above). This
+		// is what makes a "jump to a window" land even when we'd hidden it (other
+		// workspace / off view): run_effector un-hides and re-tiles it.
+		id, _ := frontmost_managed()
+		cur, has := layout.focused_window(cur_strip())
+		stale_active := g_stale_raise_id != 0 && mac.CFAbsoluteTimeGetCurrent() < g_stale_raise_until
+		act := follow_action(id, g_last_synced_id, cur, has, g_stale_raise_id, stale_active, g_follow_candidate)
+		g_follow_candidate = act == .Arm ? id : 0
+		switch act {
+		case .Record:
 			g_last_synced_id = id
-			if cur, has := layout.focused_window(cur_strip()); !has || cur != id {
-				focus_window_id(id)
-				run_effector(nil) // switch workspace / un-hide / re-tile
-				raise_focused() // re-assert focus after un-minimize
-				update_bar()
-			}
+		case .Follow:
+			g_last_synced_id = id
+			focus_window_id(id)
+			run_effector(nil) // switch workspace / un-hide / re-tile
+			raise_focused() // re-assert focus after un-minimize
+			update_bar()
+		case .Reassert:
+			g_stale_raise_id = 0
+			raise_focused() // our late-landing write stole frontmost — take it back
+		case .Ignore, .Arm:
 		}
 	}
 	update_focus_ring()
@@ -1111,6 +1197,7 @@ raise_focused :: proc() {
 			// Snappy app: raise now (off the main thread) and guard against the
 			// follow tick bouncing focus away before it comes frontmost.
 			g_pending_raise_id = 0
+			note_raise_issued(id)
 			enqueue_focus(m.ax, m.pid, false)
 			arm_activation_guard(m.pid)
 		}
@@ -1133,12 +1220,33 @@ arm_activation_guard :: proc(pid: i32) {
 	g_activating_until = mac.CFAbsoluteTimeGetCurrent() + ACTIVATE_TIMEOUT
 }
 
+// Bookkeeping around every focus write we enqueue: if it supersedes a slow
+// raise still in flight, remember that window as stale so the follow tick can
+// recognize its late arrival as ours (and re-assert) instead of following it.
+@(private = "file")
+note_raise_issued :: proc(id: layout.Window_Id) {
+	if pm, ok := g.reg[g_issued_raise_id]; ok && raise_superseded_late(g_issued_raise_id, id, pm.loose, pm.pid == mac.wm_frontmost_pid()) {
+		g_stale_raise_id = g_issued_raise_id
+		g_stale_raise_until = mac.CFAbsoluteTimeGetCurrent() + ACTIVATE_TIMEOUT
+	}
+	if g_stale_raise_id == id do g_stale_raise_id = 0 // deliberately raising it again
+	g_issued_raise_id = id
+}
+
 // Point the daemon's focus at the window the user actually has focused in the OS
-// (e.g. after a mouse click). Returns false if that window isn't one we manage.
+// (e.g. after a mouse click). Returns false while still waiting: the clicked
+// window's app may not be frontmost yet (a match on the window we already
+// focus is just the pre-click frontmost), and a new frontmost must hold for
+// two consecutive ticks — a click on the focused window leaves this armed for
+// CLICK_SYNC_TICKS, and an Outlook reminder blip landing in that window used
+// to be adopted as the click's target instantly.
 @(private = "file")
 sync_focus_from_os :: proc() -> bool {
-	id, ok := frontmost_managed()
-	if !ok do return false
+	id, _ := frontmost_managed()
+	cur, has := layout.focused_window(cur_strip())
+	act := click_sync_action(id, cur, has, g_follow_candidate)
+	g_follow_candidate = act == .Arm ? id : 0
+	if act != .Sync do return false
 	focus_window_id(id)
 	return true
 }
@@ -1303,6 +1411,7 @@ toggle_float_focused :: proc() {
 		centre := layout.apply_preset(cur_mon().viewport, .Center)
 		set_placed(id, centre)
 		enqueue_frame(m.ax, centre, false, m.loose)
+		note_raise_issued(id)
 		enqueue_focus(m.ax, m.pid, m.loose)
 		arm_activation_guard(m.pid)
 	}
@@ -1394,7 +1503,7 @@ full_resync :: proc() {
 	clear_registry()
 	destroy_monitors()
 	build_monitors() // re-read displays too, so this doubles as hotplug handling
-	reconcile()
+	reconcile(home_new_at_frame = true)
 }
 
 // Whether a freshly-seen window should be adopted into the tiling strip. Skips
@@ -1408,8 +1517,13 @@ should_tile :: proc(w: mac.Std_Window) -> bool {
 	return true
 }
 
+// home_new_at_frame: initial adoption / full resync homes each window on the
+// monitor its frame sits on (they have legitimate positions). Steady-state
+// ticks home new windows on the FOCUSED monitor instead — macOS opens a
+// window on whichever display the app last used, which is not where the user
+// is looking.
 @(private = "file")
-reconcile :: proc() -> (added: int, removed: int, retagged: int) {
+reconcile :: proc(home_new_at_frame := false) -> (added: int, removed: int, retagged: int) {
 	if len(g.monitors) == 0 do return // no displays to home windows on; timer_cb rebuilds on wake
 	wins := mac.standard_windows(g.manage_app)
 	defer delete(wins)
@@ -1444,6 +1558,12 @@ reconcile :: proc() -> (added: int, removed: int, retagged: int) {
 	matched := make([]bool, len(wins))
 	defer delete(matched)
 
+	// The window server's full list (all Spaces, minimized, hidden apps) —
+	// fetched lazily, only on ticks where some managed window went missing.
+	all_cg: map[u32]bool
+	all_cg_fetched := false
+	defer delete(all_cg)
+
 	to_remove: [dynamic]layout.Window_Id
 	defer delete(to_remove)
 	for id, m in g.reg {
@@ -1469,7 +1589,23 @@ reconcile :: proc() -> (added: int, removed: int, retagged: int) {
 		// free syscall (signal 0), no AX.
 		if !found {
 			alive := posix.kill(posix.pid_t(m.pid), .NONE) == .OK
-			if absent_window_closed(m.hidden, alive, mac.ax_pid_slow(m.pid), m.pid in slow_batch_pids) {
+			slow := mac.ax_pid_slow(m.pid)
+			// Ask the window's own AX element whether it still exists — the
+			// reliable per-window check. Skip a slow app (we won't block on it)
+			// and fall back to the server list below.
+			ax_alive, ax_decided := false, false
+			if alive && !slow {
+				ax_alive, ax_decided = mac.ax_window_alive(m.ax)
+			}
+			cg_listed := false
+			if alive && !ax_decided && m.cgwin != 0 {
+				if !all_cg_fetched {
+					all_cg = mac.all_window_ids()
+					all_cg_fetched = true
+				}
+				cg_listed = m.cgwin in all_cg
+			}
+			if absent_window_closed(m.hidden, alive, slow, m.pid in slow_batch_pids, m.cgwin != 0, cg_listed, ax_alive, ax_decided) {
 				append(&to_remove, id)
 			}
 		}
@@ -1496,10 +1632,8 @@ reconcile :: proc() -> (added: int, removed: int, retagged: int) {
 			mac.std_window_destroy(w)
 			continue
 		}
-		// Home the window on the monitor its frame currently sits on, in that
-		// monitor's focused workspace.
 		cx, cy := layout.center_of(to_rect(w.frame))
-		mi := monitor_for_point(cx, cy)
+		mi := home_new_at_frame ? monitor_for_point(cx, cy) : g.focused_monitor
 		mon := &g.monitors[mi]
 
 		id := layout.Window_Id(g.next_id)

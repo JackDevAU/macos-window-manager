@@ -261,6 +261,31 @@ ax_title :: proc(el: AXUIElement, allocator := context.allocator) -> (string, bo
 	return ax_string(el, "AXTitle", allocator)
 }
 
+// Does this AX element still refer to a live window? Reads a trivial attribute
+// (AXRole) under the fast timeout. `decided` is false when the app's AX server
+// didn't answer (.CannotComplete — a slow/backed-off app); the caller must not
+// read that as closed. A closed window's element answers .InvalidUIElement
+// immediately, so this is the ground truth the Space-local window lists can't
+// give: unlike CGWindowListCopyWindowInfo, which keeps a closed OFF-SCREEN
+// (parked) window's id around until it's next composited, a dead element is
+// dead now — and a window merely on another Space / hidden / minimized still
+// answers .Success.
+ax_window_alive :: proc(el: AXUIElement) -> (alive: bool, decided: bool) {
+	AXUIElementSetMessagingTimeout(el, AX_CALL_TIMEOUT)
+	val, err := ax_get_err(el, "AXRole")
+	#partial switch err {
+	case .Success:
+		CF.Release(val)
+		return true, true
+	case .NoValue, .AttributeUnsupported:
+		return true, true // element answered, just not with a role: it exists
+	case .InvalidUIElement:
+		return false, true // the window server says this element is gone
+	case:
+		return false, false // .CannotComplete etc: slow app, no verdict
+	}
+}
+
 // A window's top-left position (global CG coordinates).
 //
 // Note: AXValueGetValue must be called *before* building the return tuple.

@@ -103,6 +103,23 @@ standard_windows :: proc(app_filter: string = "", allocator := context.allocator
 	return out
 }
 
+// Every CGWindowID the window server knows about — including windows on other
+// Spaces, minimized ones, and those of hidden (Cmd+H) apps. The on-screen list
+// is Space-local, so this is the ground truth for "does this window still
+// exist": absent here means genuinely closed. One window-server call, no AX.
+all_window_ids :: proc(allocator := context.allocator) -> map[u32]bool {
+	out := make(map[u32]bool, allocator)
+	arr := CGWindowListCopyWindowInfo(u32(CGWindowListOption.ExcludeDesktopElements), 0)
+	if arr == nil do return out
+	defer CF.Release(arr)
+	n := CFArrayGetCount(arr)
+	for i in 0 ..< n {
+		d := CFArrayGetValueAtIndex(arr, i)
+		if num, ok := dict_number_i32(d, "kCGWindowNumber"); ok do out[u32(num)] = true
+	}
+	return out
+}
+
 // Windows of the apps currently in AX backoff, enumerated with the patient
 // timeout. Run this OFF the main thread (the daemon's slow lane): each call
 // may block for up to AX_PATIENT_TIMEOUT × calls, which is the whole point —
