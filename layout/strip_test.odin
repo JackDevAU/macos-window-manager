@@ -180,6 +180,20 @@ test_cycle_width :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_set_window_width :: proc(t: ^testing.T) {
+	s := make_strip()
+	defer strip_destroy(&s)
+	append_window(&s, 1, 1.0) // loose adoption: full-viewport column
+	append_window(&s, 2, 0.5) // focus moves here; 1 is no longer focused
+	s.columns[0].eff_w = 999
+
+	testing.expect(t, set_window_width(&s, 1, DEFAULT_WIDTH))
+	testing.expect(t, near(s.columns[0].width_frac, DEFAULT_WIDTH))
+	testing.expect_value(t, s.columns[0].eff_w, 0) // re-probe at the new width
+	testing.expect(t, !set_window_width(&s, 99, DEFAULT_WIDTH))
+}
+
+@(test)
 test_consume_and_expel :: proc(t: ^testing.T) {
 	s := make_strip()
 	defer strip_destroy(&s)

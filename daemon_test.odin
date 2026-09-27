@@ -251,3 +251,14 @@ test_activation_guard :: proc(t: ^testing.T) {
 	testing.expect(t, activation_guard_done(42, 42, 0.0, 2.0)) // frontmost now: guard lifts
 	testing.expect(t, activation_guard_done(42, 1, 2.0, 2.0)) // deadline hit: give up
 }
+
+@(test)
+test_orig_for_adopted :: proc(t: ^testing.T) {
+	vp := layout.Rect{0, 40, 1000, 600}
+	on := layout.Rect{10, 50, 300, 200}
+	testing.expect_value(t, orig_for_adopted(on, true, vp), on)
+	parked := layout.Rect{-5000, 40, 400, 300}
+	testing.expect_value(t, orig_for_adopted(parked, false, vp), layout.Rect{300, 190, 400, 300})
+	huge := layout.Rect{-5000, 40, 4000, 3000}
+	testing.expect_value(t, orig_for_adopted(huge, false, vp), vp)
+}

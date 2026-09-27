@@ -229,6 +229,11 @@ CLICK_SYNC_TICKS :: 4
 ACTIVATE_TIMEOUT :: mac.CFAbsoluteTime(2.0) // give up waiting for a window to come frontmost
 LOOSE_RAISE_DWELL :: mac.CFAbsoluteTime(0.18) // settle time before raising a slow window
 
+// A tap callback that overruns the WindowServer's budget has its keystroke
+// passed through to the app (the stray ∆˚¬˙) and the tap disabled. Log any
+// dispatch that gets near that budget so the culprit is visible in the log.
+TAP_SLOW_MS :: 100.0
+
 GAP :: 12
 IDLE_MS :: 500
 FOCUS_MS :: 120
@@ -725,6 +730,8 @@ focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 tap_cb :: proc "c" (proxy: mac.CGEventTapProxy, type: u32, event: mac.CGEvent, userInfo: rawptr) -> mac.CGEvent {
 	context = runtime.default_context()
 	if type == mac.kCGEventTapDisabledByTimeout || type == mac.kCGEventTapDisabledByUserInput {
+		why := type == mac.kCGEventTapDisabledByTimeout ? "timeout (callback overran)" : "user input"
+		fmt.printfln("tap DISABLED: %s — re-enabling", why)
 		if g_tap != nil do mac.CGEventTapEnable(g_tap, true)
 		return event
 	}
@@ -734,7 +741,11 @@ tap_cb :: proc "c" (proxy: mac.CGEventTapProxy, type: u32, event: mac.CGEvent, u
 		flags := mac.CGEventGetFlags(event)
 		if (flags & mac.FLAG_ALT) != 0 || (flags & mac.FLAG_CONTROL) != 0 {
 			keycode := mac.CGEventGetIntegerValueField(event, mac.kCGKeyboardEventKeycode)
-			if dispatch_hotkey(keycode, flags) {
+			t0 := mac.CFAbsoluteTimeGetCurrent()
+			handled := dispatch_hotkey(keycode, flags)
+			ms := f64(mac.CFAbsoluteTimeGetCurrent() - t0) * 1000
+			if ms > TAP_SLOW_MS do fmt.printfln("tap dispatch keycode=%d took %.0fms", keycode, ms)
+			if handled {
 				return mac.CGEvent(nil) // consume the keystroke
 			}
 		}
@@ -1500,10 +1511,26 @@ clear_registry :: proc() {
 
 @(private = "file")
 full_resync :: proc() {
+	// Keep each display's Alt+T state: a sleep/wake or resolution change must
+	// not silently switch tiling back on for a monitor the user turned off.
+	manual := make(map[u32]bool)
+	defer delete(manual)
+	for mon in g.monitors do if !mon.live do manual[mon.display_id] = true
 	clear_registry()
 	destroy_monitors()
 	build_monitors() // re-read displays too, so this doubles as hotplug handling
+	for &mon in g.monitors do if mon.display_id in manual do mon.live = false
 	reconcile(home_new_at_frame = true)
+}
+
+// The frame to restore an adopted window to when tiling is turned off. A window
+// whose centre is on no display was parked off-screen by a previous daemon run;
+// "restoring" it there would leave it invisible, so centre it in the viewport.
+orig_for_adopted :: proc(frame: layout.Rect, on_display: bool, viewport: layout.Rect) -> layout.Rect {
+	if on_display do return frame
+	w := min(frame.w, viewport.w)
+	h := min(frame.h, viewport.h)
+	return {viewport.x + (viewport.w - w) / 2, viewport.y + (viewport.h - h) / 2, w, h}
 }
 
 // Whether a freshly-seen window should be adopted into the tiling strip. Skips
@@ -1583,6 +1610,11 @@ reconcile :: proc(home_new_at_frame := false) -> (added: int, removed: int, reta
 			mm.loose = !m.loose
 			g.reg[id] = mm
 			retagged += 1
+			// A recovered app joins real tiling at the default width — without
+			// this it keeps the full-viewport column from its loose adoption.
+			if !mm.loose {
+				if s, ok := strip_of(mm); ok do layout.set_window_width(s, id, layout.DEFAULT_WIDTH)
+			}
 		}
 		// Absent from this tick's scan: closed, or just invisible to it?
 		// absent_window_closed has the full rules; the liveness probe is a
@@ -1635,6 +1667,7 @@ reconcile :: proc(home_new_at_frame := false) -> (added: int, removed: int, reta
 		cx, cy := layout.center_of(to_rect(w.frame))
 		mi := home_new_at_frame ? monitor_for_point(cx, cy) : g.focused_monitor
 		mon := &g.monitors[mi]
+		_, on_display := mac.display_for_point(cx, cy)
 
 		id := layout.Window_Id(g.next_id)
 		g.next_id += 1
@@ -1652,7 +1685,7 @@ reconcile :: proc(home_new_at_frame := false) -> (added: int, removed: int, reta
 			mon   = mi,
 			ws    = mon.focused_ws,
 			loose = loose,
-			orig  = to_rect(w.frame),
+			orig  = orig_for_adopted(to_rect(w.frame), on_display, mon.viewport),
 		}
 		strip := &mon.workspaces[mon.focused_ws].strip
 		if loose {
@@ -1983,6 +2016,10 @@ update_focus_ring :: proc() {
 		mac.wm_ring_hide()
 		return
 	}
+	if !g.live || !g.monitors[g.focused_monitor].live {
+		mac.wm_ring_hide() // tiling paused: no outlines
+		return
+	}
 	fid, has := layout.focused_window(cur_strip())
 	if !has {
 		mac.wm_ring_hide()
@@ -2129,6 +2166,12 @@ learn_widths :: proc(s: ^layout.Strip) {
 		m, ok := g.reg[id]
 		if !ok || m.hidden != .None || m.req_w <= 0 do continue // only on-screen, already-asked windows
 		if m.loose do continue // full-width by design; not worth an AX read to a slow app
+		// This runs inside the event-tap callback (every hotkey press). A backed-off
+		// app costs AX_CALL_TIMEOUT here, and a few of them on screen push the
+		// callback past the WindowServer's budget — which passes the keystroke
+		// through to the app (stray ∆˚¬˙) and disables the tap. Skip them; their
+		// width is re-learned once the backoff lifts.
+		if mac.ax_pid_slow(m.pid) do continue
 		sz, got := mac.ax_size(m.ax)
 		if !got do continue
 		actual := f64(sz.width)

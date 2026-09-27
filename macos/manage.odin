@@ -150,8 +150,14 @@ slow_app_windows :: proc(app_filter: string = "", allocator := context.allocator
 		defer delete(owner)
 		if app_filter != "" && owner != app_filter do continue
 
+		deadline := ax_backoff_deadline(pid)
 		start := len(out)
 		append_windows_of_app(&out, pid, owner, AX_PATIENT_TIMEOUT, abort_when_slow = false)
+
+		// Every AX call answered fast (nothing re-marked the pid) and windows
+		// came back: the app has recovered — lift the backoff now so the fast
+		// lane takes it back and reconcile retags its windows to real tiling.
+		if len(out) > start do ax_backoff_lift_if_unchanged(pid, deadline)
 
 		// A loose app is lightly wrapped: track only its one primary window.
 		// Godot & co. spawn child windows (the "Create New Node" dialog, docks,
