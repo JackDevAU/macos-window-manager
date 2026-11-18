@@ -72,6 +72,14 @@ int32_t wm_frontmost_pid(void) {
 
 static NSWindow *gRing = nil;
 
+// The border is drawn inside the ring window, so the ring is grown by
+// RING_OUTSET on every side to sit in the layout gutter instead of on top of
+// the window's own edge pixels (Discord's notification badges, scroll bars...).
+// Kept under half the layout gap so neighbouring rings never touch.
+#define RING_BORDER 4.0
+#define RING_CLEARANCE 2.0 // bare pixels between the window edge and the border
+#define RING_OUTSET (RING_BORDER + RING_CLEARANCE)
+
 static void ensure_ring(void) {
 	if (gRing != nil) {
 		return;
@@ -97,8 +105,8 @@ static void ensure_ring(void) {
 	NSView *v = [[NSView alloc] initWithFrame:w.contentView.bounds];
 	v.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 	v.wantsLayer = YES;
-	v.layer.borderWidth = 4.0;
-	v.layer.cornerRadius = 9.0;
+	v.layer.borderWidth = RING_BORDER;
+	v.layer.cornerRadius = 9.0 + RING_OUTSET;
 	v.layer.borderColor = [NSColor colorWithCalibratedRed:0.20 green:0.65 blue:1.0 alpha:0.95].CGColor;
 	v.layer.backgroundColor = [NSColor clearColor].CGColor;
 	w.contentView = v;
@@ -115,7 +123,11 @@ void wm_ring_show(double x, double y, double w, double h) {
 		return;
 	}
 	double nsY = primaryH - (y + h); // flip top-left -> AppKit bottom-left
-	[gRing setFrame:NSMakeRect(x, nsY, w, h) display:YES];
+	[gRing setFrame:NSMakeRect(x - RING_OUTSET,
+	                           nsY - RING_OUTSET,
+	                           w + 2 * RING_OUTSET,
+	                           h + 2 * RING_OUTSET)
+	        display:YES];
 	[gRing orderFront:nil];
 }
 

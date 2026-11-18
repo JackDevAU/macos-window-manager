@@ -223,6 +223,24 @@ ax_pid_slow :: proc(pid: i32) -> bool {
 	return true
 }
 
+// A pid's current backoff deadline (0 when not backed off). Snapshot before an
+// enumeration, then pass to ax_backoff_lift_if_unchanged after it.
+ax_backoff_deadline :: proc(pid: i32) -> CFAbsoluteTime {
+	sync.mutex_lock(&ax_slow_mu)
+	defer sync.mutex_unlock(&ax_slow_mu)
+	return ax_slow_until[pid]
+}
+
+// Lift a pid's backoff early — but only if its deadline still equals the
+// snapshot, i.e. no call re-marked the app slow in between. A launching app is
+// slow only for its first seconds; without this it stays backed off (and its
+// windows loose) for the full AX_BACKOFF_SECS after it has recovered.
+ax_backoff_lift_if_unchanged :: proc(pid: i32, deadline: CFAbsoluteTime) {
+	sync.mutex_lock(&ax_slow_mu)
+	defer sync.mutex_unlock(&ax_slow_mu)
+	if ax_slow_until[pid] == deadline do delete_key(&ax_slow_until, pid)
+}
+
 // Copy an AX attribute as a raw CF object, reporting the AXError so callers can
 // tell a timeout (.CannotComplete — the app's AX server didn't answer) from a
 // plain miss. Also the central slow-call detector: any call that took longer
@@ -259,6 +277,31 @@ ax_string :: proc(el: AXUIElement, attr: cstring, allocator := context.allocator
 // A window's title. Caller frees the string.
 ax_title :: proc(el: AXUIElement, allocator := context.allocator) -> (string, bool) {
 	return ax_string(el, "AXTitle", allocator)
+}
+
+// Does this AX element still refer to a live window? Reads a trivial attribute
+// (AXRole) under the fast timeout. `decided` is false when the app's AX server
+// didn't answer (.CannotComplete — a slow/backed-off app); the caller must not
+// read that as closed. A closed window's element answers .InvalidUIElement
+// immediately, so this is the ground truth the Space-local window lists can't
+// give: unlike CGWindowListCopyWindowInfo, which keeps a closed OFF-SCREEN
+// (parked) window's id around until it's next composited, a dead element is
+// dead now — and a window merely on another Space / hidden / minimized still
+// answers .Success.
+ax_window_alive :: proc(el: AXUIElement) -> (alive: bool, decided: bool) {
+	AXUIElementSetMessagingTimeout(el, AX_CALL_TIMEOUT)
+	val, err := ax_get_err(el, "AXRole")
+	#partial switch err {
+	case .Success:
+		CF.Release(val)
+		return true, true
+	case .NoValue, .AttributeUnsupported:
+		return true, true // element answered, just not with a role: it exists
+	case .InvalidUIElement:
+		return false, true // the window server says this element is gone
+	case:
+		return false, false // .CannotComplete etc: slow app, no verdict
+	}
 }
 
 // A window's top-left position (global CG coordinates).

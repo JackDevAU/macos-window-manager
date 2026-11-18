@@ -195,6 +195,19 @@ set_width :: proc(s: ^Strip, frac: f64) {
 	s.columns[s.focused_col].eff_w = 0 // re-probe the real width at the new fraction
 }
 
+// Set the width of the column holding `id`, wherever it is (focused or not).
+set_window_width :: proc(s: ^Strip, id: Window_Id, frac: f64) -> bool {
+	for &col in s.columns {
+		for t in col.tiles {
+			if t.id != id do continue
+			col.width_frac = frac
+			col.eff_w = 0 // re-probe the real width at the new fraction
+			return true
+		}
+	}
+	return false
+}
+
 // Cycle the focused column through WIDTH_PRESETS (1/3 -> 1/2 -> 2/3 -> 1/3).
 cycle_width :: proc(s: ^Strip) {
 	if len(s.columns) == 0 do return

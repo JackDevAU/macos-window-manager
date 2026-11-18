@@ -74,7 +74,20 @@ g: Daemon
 @(private = "file")
 g_listen_fd: posix.FD
 @(private = "file")
-g_tap: mac.CFMachPort
+g_tap: mac.CFMachPort // mouse tap (main thread)
+// The keyboard tap runs on its own thread so a slow main-thread tick (AX
+// reads) can never make the WindowServer time out waiting for us — which is
+// how a consumed Alt+H leaks into the app as a stray ˙. The thread only
+// decides consume/pass (a pure keycode check) and forwards the chord down a
+// pipe; the main thread dispatches it whenever it gets round to it.
+g_key_tap: mac.CFMachPort
+g_key_tap_thread: ^thread.Thread
+g_hotkey_pipe: [2]posix.FD
+Hotkey_Msg :: struct {
+	keycode: i64,
+	flags:   u64,
+	at:      mac.CFAbsoluteTime,
+}
 // After we set focus ourselves (a hotkey raise), skip this many fast ticks of
 // click-sync so it can't snap focus back before our raise has taken effect.
 @(private = "file")
@@ -113,6 +126,25 @@ g_pending_raise_id: layout.Window_Id
 @(private = "file")
 g_pending_raise_at: mac.CFAbsoluteTime
 
+// The last window we enqueued a real focus write for, and — when a newer raise
+// superseded a slow (loose) one that hadn't come frontmost yet — the superseded
+// window. A slow app's activation can land ~1s after we asked; if the OS then
+// reports THAT window frontmost, it's our own late write, not the user
+// switching ("move past Godot, it drags you back"). The follow tick re-asserts
+// instead of following, until the marker expires.
+@(private = "file")
+g_issued_raise_id: layout.Window_Id
+@(private = "file")
+g_stale_raise_id: layout.Window_Id
+@(private = "file")
+g_stale_raise_until: mac.CFAbsoluteTime
+
+// A frontmost change seen for one tick, awaiting its confirming second tick.
+// A one-tick blip (Outlook self-activating for a reminder while AX-flagged
+// slow) must never yank focus; a real switch (Cmd+Tab, Dock) persists.
+@(private = "file")
+g_follow_candidate: layout.Window_Id
+
 // How (whether) we've hidden a window. Parked windows keep a 6px on-screen
 // peek, so they stay in the on-screen enumeration; minimized ones drop out.
 Hidden :: enum {
@@ -124,15 +156,26 @@ Hidden :: enum {
 // --- pure tick decisions (unit-tested in daemon_test.odin) -------------------
 
 // A managed window absent from this tick's enumeration: is it really closed?
-// A dead pid settles it — the app is gone, so is the window. A window WE
-// minimized is expected to be absent (its app may have nothing left on screen
-// to be enumerated through), so absence proves nothing while the app lives.
-// A parked window is still on-screen by design, so it enumerates like a
-// visible one: absent means closed — except for a slow (AX-backed-off) pid,
-// which the fast lane skips; only a tick whose slow-lane batch covered that
-// pid carries enough truth.
-absent_window_closed :: proc(hidden: Hidden, pid_alive, pid_slow, pid_in_slow_batch: bool) -> bool {
+// A dead pid settles it — the app is gone, so is the window. Otherwise the
+// window's own AX element is ground truth: probing it (ax_window_alive) answers
+// .InvalidUIElement the instant it's gone, yet .Success for a window merely on
+// another Space / hidden / minimized. That distinction is why the on-screen
+// enumeration alone can't decide: it's Space-local, so a fullscreen app, a
+// Space switch, or Cmd+H drops every managed window from it at once — reading
+// that as "closed" mass-removed them, then re-adoption scattered them across
+// monitors and stole focus.
+//
+// AX can be inconclusive (`!ax_decided`) for an AX-backed-off (slow) app, whose
+// element we won't block on. Then fall back: the window server's FULL list
+// (cg_listed) still knows an off-Space window exists — but it also KEEPS a
+// closed off-screen (parked) window's id around a while, so it can only clear a
+// slow app's window, never confirm one closed here; a window WE minimized is
+// expected to be absent while its app lives; a parked/visible window without a
+// CGWindowID rides the slow-lane batch (only a tick that covered its pid knows).
+absent_window_closed :: proc(hidden: Hidden, pid_alive, pid_slow, pid_in_slow_batch: bool, cg_known, cg_listed: bool, ax_alive, ax_decided: bool) -> bool {
 	if !pid_alive do return true
+	if ax_decided do return !ax_alive // the element itself: alive means on another Space / hidden, not closed
+	if cg_known do return !cg_listed
 	if hidden == .Minimized do return false
 	return !pid_slow || pid_in_slow_batch
 }
@@ -155,10 +198,54 @@ activation_guard_done :: proc(guard_pid, frontmost_pid: i32, now, deadline: mac.
 	return frontmost_pid == guard_pid || now >= deadline
 }
 
+// What the follow tick should do about the OS-frontmost managed window.
+Follow_Action :: enum {
+	Ignore, // nothing managed frontmost, or no change since last sync
+	Record, // frontmost is already the daemon's focus — just remember it
+	Arm, // frontmost changed this tick — confirm on the next before acting
+	Follow, // confirmed external switch (Cmd+Tab, Dock, Raycast) — adopt it
+	Reassert, // our superseded slow raise landed late — put focus back on ours
+}
+
+follow_action :: proc(frontmost, last_synced, cur_focused: layout.Window_Id, has_cur: bool, stale: layout.Window_Id, stale_active: bool, candidate: layout.Window_Id) -> Follow_Action {
+	if frontmost == 0 do return .Ignore
+	if frontmost == last_synced do return .Ignore
+	if has_cur && frontmost == cur_focused do return .Record
+	if stale_active && frontmost == stale do return .Reassert
+	if frontmost != candidate do return .Arm
+	return .Follow
+}
+
+// What a post-click sync tick should do about the OS-frontmost managed window.
+Click_Sync_Action :: enum {
+	Wait, // nothing managed frontmost, or still the pre-click window — keep waiting
+	Arm, // a new window came frontmost — confirm on the next tick before syncing
+	Sync, // held frontmost two consecutive ticks: this is the click's target
+}
+
+click_sync_action :: proc(frontmost, cur_focused: layout.Window_Id, has_cur: bool, candidate: layout.Window_Id) -> Click_Sync_Action {
+	if frontmost == 0 do return .Wait
+	if has_cur && frontmost == cur_focused do return .Wait
+	return frontmost == candidate ? .Sync : .Arm
+}
+
+// Issuing a raise for `new` supersedes the previous one. The old write can only
+// land late (and steal focus back) if it went to the slow queue (a loose
+// window) and its app hadn't come frontmost yet when it was superseded — a
+// fast-queue write is either replaced in-queue or lands in milliseconds.
+raise_superseded_late :: proc(prev, new: layout.Window_Id, prev_loose, prev_arrived: bool) -> bool {
+	return prev != 0 && prev != new && prev_loose && !prev_arrived
+}
+
 FOCUS_HOLD_TICKS :: 3
 CLICK_SYNC_TICKS :: 4
 ACTIVATE_TIMEOUT :: mac.CFAbsoluteTime(2.0) // give up waiting for a window to come frontmost
 LOOSE_RAISE_DWELL :: mac.CFAbsoluteTime(0.18) // settle time before raising a slow window
+
+// A tap callback that overruns the WindowServer's budget has its keystroke
+// passed through to the app (the stray ∆˚¬˙) and the tap disabled. Log any
+// dispatch that gets near that budget so the culprit is visible in the log.
+TAP_SLOW_MS :: 100.0
 
 GAP :: 12
 IDLE_MS :: 500
@@ -222,6 +309,7 @@ run_daemon :: proc(manage_app: string = "") {
 
 	g.reg = make(map[layout.Window_Id]Managed)
 	g.ignore_apps = make(map[string]bool)
+	g.next_id = 1 // id 0 is the "no window" sentinel throughout this file
 	build_monitors() // one independent tiling area per physical display
 	g.live = true // start tiling immediately (use `wm live off` / Alt+T to pause)
 	g.manage_app = manage_app
@@ -248,11 +336,19 @@ run_daemon :: proc(manage_app: string = "") {
 	if !input_ok {
 		mac.CGRequestListenEventAccess() // shows the system prompt / adds us to the list
 	}
-	mask := mac.event_mask_bit(mac.kCGEventKeyDown) | mac.event_mask_bit(mac.kCGEventLeftMouseDown)
+	mask := mac.event_mask_bit(mac.kCGEventLeftMouseDown)
 	g_tap = mac.CGEventTapCreate(mac.kCGSessionEventTap, mac.kCGHeadInsertEventTap, mac.kCGEventTapOptionDefault, mask, tap_cb, nil)
 	if g_tap != nil {
 		mac.CFRunLoopAddSource(rl, mac.CFMachPortCreateRunLoopSource(nil, g_tap, 0), mac.kCFRunLoopDefaultMode)
 		mac.CGEventTapEnable(g_tap, true)
+	}
+	if posix.pipe(&g_hotkey_pipe) == .OK {
+		posix.fcntl(g_hotkey_pipe[0], .SETFL, transmute(c.int)posix.O_Flags{.NONBLOCK})
+		hk := mac.CFFileDescriptorCreate(nil, c.int(g_hotkey_pipe[0]), false, hotkey_cb, nil)
+		mac.CFFileDescriptorEnableCallBacks(hk, mac.kCFFileDescriptorReadCallBack)
+		mac.CFRunLoopAddSource(rl, mac.CFFileDescriptorCreateRunLoopSource(nil, hk, 0), mac.kCFRunLoopDefaultMode)
+		g_key_tap = mac.CGEventTapCreate(mac.kCGSessionEventTap, mac.kCGHeadInsertEventTap, mac.kCGEventTapOptionDefault, mac.event_mask_bit(mac.kCGEventKeyDown), key_tap_cb, nil)
+		if g_key_tap != nil do g_key_tap_thread = thread.create_and_start(key_tap_loop)
 	}
 
 	// Periodic reconcile (auto-track + auto-tile when live).
@@ -279,7 +375,7 @@ run_daemon :: proc(manage_app: string = "") {
 	scope := manage_app == "" ? "all apps" : manage_app
 	fmt.printfln("niri-mac daemon listening on %s", SOCKET_PATH)
 	fmt.printfln("  managing %s, TILING (use `wm live off` or Alt+T to pause)", scope)
-	if g_tap != nil && input_ok {
+	if g_key_tap != nil && input_ok {
 		fmt.println("  hotkeys: ENABLED (Alt+hjkl focus, r=width m=maximize g=grid/columns f=float ,/.=consume/expel Alt+Shift+,=group 1-9=focus, Ctrl+1-9=workspace, t=tiling this monitor; Cmd+Tab is native)")
 	} else {
 		fmt.println("  hotkeys: NOT ACTIVE — grant Input Monitoring to your terminal in")
@@ -287,7 +383,7 @@ run_daemon :: proc(manage_app: string = "") {
 	}
 
 	// Adopt and tile the current windows immediately, before entering the loop.
-	reconcile()
+	reconcile(home_new_at_frame = true)
 	run_effector(nil)
 
 	// Run the AppKit event loop (not a bare CFRunLoopRun) so the settings window's
@@ -584,6 +680,7 @@ focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 		switch pending_raise_tick(g_pending_raise_id, cur, has, mac.CFAbsoluteTimeGetCurrent(), g_pending_raise_at) {
 		case .Raise:
 			if m, ok := g.reg[g_pending_raise_id]; ok {
+				note_raise_issued(g_pending_raise_id)
 				enqueue_focus(m.ax, m.pid, true)
 				arm_activation_guard(m.pid)
 			}
@@ -613,23 +710,38 @@ focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 		g_click_sync -= 1
 		if sync_focus_from_os() { // matched the clicked window into the strip
 			g_click_sync = 0
-			update_bar() // re-highlight the focused segment
+			// The clicked window may live on another workspace/monitor: the sync
+			// switched daemon focus there, but only the effector un-hides that
+			// workspace and re-parks the old one. It also refreshes ring + bar;
+			// on a plain same-workspace click nothing moved, so it's just that.
+			run_effector(nil)
 		}
 	} else {
 		// Follow the OS focus: native Cmd+Tab, Raycast, Spotlight, the Dock — any
 		// activation of a window we manage. Acts only when the frontmost window
-		// *changes* and isn't already our focus, so it never fights hotkey nav
-		// (which is further guarded by g_focus_hold above). This is what makes a
-		// "jump to a window" land even when we'd hidden it (other workspace / off
-		// view): run_effector un-hides and re-tiles it.
-		if id, ok := frontmost_managed(); ok && id != g_last_synced_id {
+		// *changes*, holds steady for two ticks (a self-activating app's blip is
+		// not a switch), and isn't a stale raise of our own landing late — so it
+		// never fights hotkey nav (further guarded by g_focus_hold above). This
+		// is what makes a "jump to a window" land even when we'd hidden it (other
+		// workspace / off view): run_effector un-hides and re-tiles it.
+		id, _ := frontmost_managed()
+		cur, has := layout.focused_window(cur_strip())
+		stale_active := g_stale_raise_id != 0 && mac.CFAbsoluteTimeGetCurrent() < g_stale_raise_until
+		act := follow_action(id, g_last_synced_id, cur, has, g_stale_raise_id, stale_active, g_follow_candidate)
+		g_follow_candidate = act == .Arm ? id : 0
+		switch act {
+		case .Record:
 			g_last_synced_id = id
-			if cur, has := layout.focused_window(cur_strip()); !has || cur != id {
-				focus_window_id(id)
-				run_effector(nil) // switch workspace / un-hide / re-tile
-				raise_focused() // re-assert focus after un-minimize
-				update_bar()
-			}
+		case .Follow:
+			g_last_synced_id = id
+			focus_window_id(id)
+			run_effector(nil) // switch workspace / un-hide / re-tile
+			raise_focused(warp = false) // re-assert focus after un-minimize
+			update_bar()
+		case .Reassert:
+			g_stale_raise_id = 0
+			raise_focused(warp = false) // our late-landing write stole frontmost — take it back
+		case .Ignore, .Arm:
 		}
 	}
 	update_focus_ring()
@@ -639,20 +751,12 @@ focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 tap_cb :: proc "c" (proxy: mac.CGEventTapProxy, type: u32, event: mac.CGEvent, userInfo: rawptr) -> mac.CGEvent {
 	context = runtime.default_context()
 	if type == mac.kCGEventTapDisabledByTimeout || type == mac.kCGEventTapDisabledByUserInput {
+		why := type == mac.kCGEventTapDisabledByTimeout ? "timeout (callback overran)" : "user input"
+		fmt.printfln("tap DISABLED: %s — re-enabling", why)
 		if g_tap != nil do mac.CGEventTapEnable(g_tap, true)
 		return event
 	}
-	if type == mac.kCGEventKeyDown {
-		// We only inspect Alt-chords (our keymap) and Ctrl+digit (workspaces);
-		// other keys — including Cmd+Tab — pass straight through, never recorded.
-		flags := mac.CGEventGetFlags(event)
-		if (flags & mac.FLAG_ALT) != 0 || (flags & mac.FLAG_CONTROL) != 0 {
-			keycode := mac.CGEventGetIntegerValueField(event, mac.kCGKeyboardEventKeycode)
-			if dispatch_hotkey(keycode, flags) {
-				return mac.CGEvent(nil) // consume the keystroke
-			}
-		}
-	} else if type == mac.kCGEventLeftMouseDown {
+	if type == mac.kCGEventLeftMouseDown {
 		loc := mac.CGEventGetLocation(event)
 		if bar_click(f64(loc.x), f64(loc.y)) {
 			return mac.CGEvent(nil) // consumed a click on the bar
@@ -662,6 +766,47 @@ tap_cb :: proc "c" (proxy: mac.CGEventTapProxy, type: u32, event: mac.CGEvent, u
 		g_click_sync = CLICK_SYNC_TICKS
 	}
 	return event
+}
+
+// Keyboard tap thread: its own CFRunLoop, nothing else on it.
+key_tap_loop :: proc() {
+	rl := mac.CFRunLoopGetCurrent()
+	mac.CFRunLoopAddSource(rl, mac.CFMachPortCreateRunLoopSource(nil, g_key_tap, 0), mac.kCFRunLoopDefaultMode)
+	mac.CGEventTapEnable(g_key_tap, true)
+	mac.CFRunLoopRun()
+}
+
+// Runs on the tap thread: consume our chords instantly, forward them to the
+// main thread. Only Alt/Ctrl chords in our keymap are touched; everything
+// else — including Cmd+Tab — passes straight through, never recorded.
+key_tap_cb :: proc "c" (proxy: mac.CGEventTapProxy, type: u32, event: mac.CGEvent, userInfo: rawptr) -> mac.CGEvent {
+	context = runtime.default_context()
+	if type == mac.kCGEventTapDisabledByTimeout || type == mac.kCGEventTapDisabledByUserInput {
+		fmt.printfln("key tap DISABLED: %s — re-enabling", type == mac.kCGEventTapDisabledByTimeout ? "timeout" : "user input")
+		if g_key_tap != nil do mac.CGEventTapEnable(g_key_tap, true)
+		return event
+	}
+	if type != mac.kCGEventKeyDown do return event
+	flags := mac.CGEventGetFlags(event)
+	keycode := mac.CGEventGetIntegerValueField(event, mac.kCGKeyboardEventKeycode)
+	if !hotkey_recognized(keycode, flags) do return event
+	msg := Hotkey_Msg{keycode, flags, mac.CFAbsoluteTimeGetCurrent()}
+	posix.write(g_hotkey_pipe[1], ([^]byte)(rawptr(&msg)), size_of(msg))
+	return mac.CGEvent(nil)
+}
+
+// Main thread: drain forwarded chords and dispatch them.
+@(private = "file")
+hotkey_cb :: proc "c" (f: mac.CFFileDescriptor, types: u64, info: rawptr) {
+	context = runtime.default_context()
+	for {
+		msg: Hotkey_Msg
+		if posix.read(g_hotkey_pipe[0], ([^]byte)(rawptr(&msg)), size_of(msg)) != size_of(msg) do break
+		waited := f64(mac.CFAbsoluteTimeGetCurrent() - msg.at) * 1000
+		if waited > TAP_SLOW_MS do fmt.printfln("hotkey keycode=%d waited %.0fms for the main thread", msg.keycode, waited)
+		dispatch_hotkey(msg.keycode, msg.flags)
+	}
+	mac.CFFileDescriptorEnableCallBacks(f, mac.kCFFileDescriptorReadCallBack)
 }
 
 // Handle a left-click that landed on a status bar: focus the window whose segment
@@ -695,7 +840,7 @@ bar_click :: proc(cx, cy: f64) -> bool {
 		if id != mac.WM_BAR_NONE {
 			focus_window_id(layout.Window_Id(id))
 			run_effector(nil)
-			raise_focused()
+			raise_focused(warp = false)
 		}
 		return true // inside a bar (nothing tiled behind it) — consume
 	}
@@ -723,7 +868,27 @@ stage_focused :: proc() {
 	mac.wm_stage_capture_window(wid)
 }
 
+// Pure: is this chord one of ours? Must agree with dispatch_hotkey — the tap
+// thread consumes on this answer alone, before the main thread acts.
+hotkey_recognized :: proc(keycode: i64, flags: u64) -> bool {
+	alt := (flags & mac.FLAG_ALT) != 0
+	ctrl := (flags & mac.FLAG_CONTROL) != 0
+	if alt && ctrl do return keycode == KEY_J || keycode == KEY_K
+	if ctrl {
+		_, is_digit := digit_for_keycode(keycode)
+		return is_digit
+	}
+	if !alt do return false
+	switch keycode {
+	case KEY_S, KEY_F, KEY_P, KEY_H, KEY_L, KEY_J, KEY_K, KEY_R, KEY_M, KEY_Z, KEY_G, KEY_COMMA, KEY_PERIOD, KEY_T:
+		return true
+	}
+	_, is_digit := digit_for_keycode(keycode)
+	return is_digit
+}
+
 dispatch_hotkey :: proc(keycode: i64, flags: u64) -> bool {
+	if !hotkey_recognized(keycode, flags) do return false
 	shift := (flags & mac.FLAG_SHIFT) != 0
 
 	// Alt+Ctrl+J/K: move the focused window to the next/prev monitor (and follow
@@ -1094,7 +1259,7 @@ focus_column :: proc(n: int) {
 
 // Give the daemon's focused window real keyboard focus (raise + activate app).
 @(private = "file")
-raise_focused :: proc() {
+raise_focused :: proc(warp := true) {
 	id, ok := layout.focused_window(cur_strip())
 	if !ok do return
 	m, found := g.reg[id]
@@ -1111,6 +1276,7 @@ raise_focused :: proc() {
 			// Snappy app: raise now (off the main thread) and guard against the
 			// follow tick bouncing focus away before it comes frontmost.
 			g_pending_raise_id = 0
+			note_raise_issued(id)
 			enqueue_focus(m.ax, m.pid, false)
 			arm_activation_guard(m.pid)
 		}
@@ -1118,7 +1284,7 @@ raise_focused :: proc() {
 		// effector just placed it at (m.placed) — no AX read, and it's exactly
 		// where the window is headed even if the async move hasn't landed yet.
 		r := m.placed
-		if r.w > 0 && r.h > 0 {
+		if warp && r.w > 0 && r.h > 0 {
 			mac.warp_mouse(r.x + r.w / 2, r.y + r.h / 2)
 		}
 	}
@@ -1133,12 +1299,33 @@ arm_activation_guard :: proc(pid: i32) {
 	g_activating_until = mac.CFAbsoluteTimeGetCurrent() + ACTIVATE_TIMEOUT
 }
 
+// Bookkeeping around every focus write we enqueue: if it supersedes a slow
+// raise still in flight, remember that window as stale so the follow tick can
+// recognize its late arrival as ours (and re-assert) instead of following it.
+@(private = "file")
+note_raise_issued :: proc(id: layout.Window_Id) {
+	if pm, ok := g.reg[g_issued_raise_id]; ok && raise_superseded_late(g_issued_raise_id, id, pm.loose, pm.pid == mac.wm_frontmost_pid()) {
+		g_stale_raise_id = g_issued_raise_id
+		g_stale_raise_until = mac.CFAbsoluteTimeGetCurrent() + ACTIVATE_TIMEOUT
+	}
+	if g_stale_raise_id == id do g_stale_raise_id = 0 // deliberately raising it again
+	g_issued_raise_id = id
+}
+
 // Point the daemon's focus at the window the user actually has focused in the OS
-// (e.g. after a mouse click). Returns false if that window isn't one we manage.
+// (e.g. after a mouse click). Returns false while still waiting: the clicked
+// window's app may not be frontmost yet (a match on the window we already
+// focus is just the pre-click frontmost), and a new frontmost must hold for
+// two consecutive ticks — a click on the focused window leaves this armed for
+// CLICK_SYNC_TICKS, and an Outlook reminder blip landing in that window used
+// to be adopted as the click's target instantly.
 @(private = "file")
 sync_focus_from_os :: proc() -> bool {
-	id, ok := frontmost_managed()
-	if !ok do return false
+	id, _ := frontmost_managed()
+	cur, has := layout.focused_window(cur_strip())
+	act := click_sync_action(id, cur, has, g_follow_candidate)
+	g_follow_candidate = act == .Arm ? id : 0
+	if act != .Sync do return false
 	focus_window_id(id)
 	return true
 }
@@ -1303,6 +1490,7 @@ toggle_float_focused :: proc() {
 		centre := layout.apply_preset(cur_mon().viewport, .Center)
 		set_placed(id, centre)
 		enqueue_frame(m.ax, centre, false, m.loose)
+		note_raise_issued(id)
 		enqueue_focus(m.ax, m.pid, m.loose)
 		arm_activation_guard(m.pid)
 	}
@@ -1391,10 +1579,26 @@ clear_registry :: proc() {
 
 @(private = "file")
 full_resync :: proc() {
+	// Keep each display's Alt+T state: a sleep/wake or resolution change must
+	// not silently switch tiling back on for a monitor the user turned off.
+	manual := make(map[u32]bool)
+	defer delete(manual)
+	for mon in g.monitors do if !mon.live do manual[mon.display_id] = true
 	clear_registry()
 	destroy_monitors()
 	build_monitors() // re-read displays too, so this doubles as hotplug handling
-	reconcile()
+	for &mon in g.monitors do if mon.display_id in manual do mon.live = false
+	reconcile(home_new_at_frame = true)
+}
+
+// The frame to restore an adopted window to when tiling is turned off. A window
+// whose centre is on no display was parked off-screen by a previous daemon run;
+// "restoring" it there would leave it invisible, so centre it in the viewport.
+orig_for_adopted :: proc(frame: layout.Rect, on_display: bool, viewport: layout.Rect) -> layout.Rect {
+	if on_display do return frame
+	w := min(frame.w, viewport.w)
+	h := min(frame.h, viewport.h)
+	return {viewport.x + (viewport.w - w) / 2, viewport.y + (viewport.h - h) / 2, w, h}
 }
 
 // Whether a freshly-seen window should be adopted into the tiling strip. Skips
@@ -1408,8 +1612,13 @@ should_tile :: proc(w: mac.Std_Window) -> bool {
 	return true
 }
 
+// home_new_at_frame: initial adoption / full resync homes each window on the
+// monitor its frame sits on (they have legitimate positions). Steady-state
+// ticks home new windows on the FOCUSED monitor instead — macOS opens a
+// window on whichever display the app last used, which is not where the user
+// is looking.
 @(private = "file")
-reconcile :: proc() -> (added: int, removed: int, retagged: int) {
+reconcile :: proc(home_new_at_frame := false) -> (added: int, removed: int, retagged: int) {
 	if len(g.monitors) == 0 do return // no displays to home windows on; timer_cb rebuilds on wake
 	wins := mac.standard_windows(g.manage_app)
 	defer delete(wins)
@@ -1444,6 +1653,12 @@ reconcile :: proc() -> (added: int, removed: int, retagged: int) {
 	matched := make([]bool, len(wins))
 	defer delete(matched)
 
+	// The window server's full list (all Spaces, minimized, hidden apps) —
+	// fetched lazily, only on ticks where some managed window went missing.
+	all_cg: map[u32]bool
+	all_cg_fetched := false
+	defer delete(all_cg)
+
 	to_remove: [dynamic]layout.Window_Id
 	defer delete(to_remove)
 	for id, m in g.reg {
@@ -1463,13 +1678,34 @@ reconcile :: proc() -> (added: int, removed: int, retagged: int) {
 			mm.loose = !m.loose
 			g.reg[id] = mm
 			retagged += 1
+			// A recovered app joins real tiling at the default width — without
+			// this it keeps the full-viewport column from its loose adoption.
+			if !mm.loose {
+				if s, ok := strip_of(mm); ok do layout.set_window_width(s, id, layout.DEFAULT_WIDTH)
+			}
 		}
 		// Absent from this tick's scan: closed, or just invisible to it?
 		// absent_window_closed has the full rules; the liveness probe is a
 		// free syscall (signal 0), no AX.
 		if !found {
 			alive := posix.kill(posix.pid_t(m.pid), .NONE) == .OK
-			if absent_window_closed(m.hidden, alive, mac.ax_pid_slow(m.pid), m.pid in slow_batch_pids) {
+			slow := mac.ax_pid_slow(m.pid)
+			// Ask the window's own AX element whether it still exists — the
+			// reliable per-window check. Skip a slow app (we won't block on it)
+			// and fall back to the server list below.
+			ax_alive, ax_decided := false, false
+			if alive && !slow {
+				ax_alive, ax_decided = mac.ax_window_alive(m.ax)
+			}
+			cg_listed := false
+			if alive && !ax_decided && m.cgwin != 0 {
+				if !all_cg_fetched {
+					all_cg = mac.all_window_ids()
+					all_cg_fetched = true
+				}
+				cg_listed = m.cgwin in all_cg
+			}
+			if absent_window_closed(m.hidden, alive, slow, m.pid in slow_batch_pids, m.cgwin != 0, cg_listed, ax_alive, ax_decided) {
 				append(&to_remove, id)
 			}
 		}
@@ -1496,11 +1732,10 @@ reconcile :: proc() -> (added: int, removed: int, retagged: int) {
 			mac.std_window_destroy(w)
 			continue
 		}
-		// Home the window on the monitor its frame currently sits on, in that
-		// monitor's focused workspace.
 		cx, cy := layout.center_of(to_rect(w.frame))
-		mi := monitor_for_point(cx, cy)
+		mi := home_new_at_frame ? monitor_for_point(cx, cy) : g.focused_monitor
 		mon := &g.monitors[mi]
+		_, on_display := mac.display_for_point(cx, cy)
 
 		id := layout.Window_Id(g.next_id)
 		g.next_id += 1
@@ -1518,7 +1753,7 @@ reconcile :: proc() -> (added: int, removed: int, retagged: int) {
 			mon   = mi,
 			ws    = mon.focused_ws,
 			loose = loose,
-			orig  = to_rect(w.frame),
+			orig  = orig_for_adopted(to_rect(w.frame), on_display, mon.viewport),
 		}
 		strip := &mon.workspaces[mon.focused_ws].strip
 		if loose {
@@ -1849,6 +2084,10 @@ update_focus_ring :: proc() {
 		mac.wm_ring_hide()
 		return
 	}
+	if !g.live || !g.monitors[g.focused_monitor].live {
+		mac.wm_ring_hide() // tiling paused: no outlines
+		return
+	}
 	fid, has := layout.focused_window(cur_strip())
 	if !has {
 		mac.wm_ring_hide()
@@ -1995,6 +2234,12 @@ learn_widths :: proc(s: ^layout.Strip) {
 		m, ok := g.reg[id]
 		if !ok || m.hidden != .None || m.req_w <= 0 do continue // only on-screen, already-asked windows
 		if m.loose do continue // full-width by design; not worth an AX read to a slow app
+		// This runs inside the event-tap callback (every hotkey press). A backed-off
+		// app costs AX_CALL_TIMEOUT here, and a few of them on screen push the
+		// callback past the WindowServer's budget — which passes the keystroke
+		// through to the app (stray ∆˚¬˙) and disables the tap. Skip them; their
+		// width is re-learned once the backoff lifts.
+		if mac.ax_pid_slow(m.pid) do continue
 		sz, got := mac.ax_size(m.ax)
 		if !got do continue
 		actual := f64(sz.width)
