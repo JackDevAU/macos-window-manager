@@ -74,7 +74,20 @@ g: Daemon
 @(private = "file")
 g_listen_fd: posix.FD
 @(private = "file")
-g_tap: mac.CFMachPort
+g_tap: mac.CFMachPort // mouse tap (main thread)
+// The keyboard tap runs on its own thread so a slow main-thread tick (AX
+// reads) can never make the WindowServer time out waiting for us — which is
+// how a consumed Alt+H leaks into the app as a stray ˙. The thread only
+// decides consume/pass (a pure keycode check) and forwards the chord down a
+// pipe; the main thread dispatches it whenever it gets round to it.
+g_key_tap: mac.CFMachPort
+g_key_tap_thread: ^thread.Thread
+g_hotkey_pipe: [2]posix.FD
+Hotkey_Msg :: struct {
+	keycode: i64,
+	flags:   u64,
+	at:      mac.CFAbsoluteTime,
+}
 // After we set focus ourselves (a hotkey raise), skip this many fast ticks of
 // click-sync so it can't snap focus back before our raise has taken effect.
 @(private = "file")
@@ -323,11 +336,19 @@ run_daemon :: proc(manage_app: string = "") {
 	if !input_ok {
 		mac.CGRequestListenEventAccess() // shows the system prompt / adds us to the list
 	}
-	mask := mac.event_mask_bit(mac.kCGEventKeyDown) | mac.event_mask_bit(mac.kCGEventLeftMouseDown)
+	mask := mac.event_mask_bit(mac.kCGEventLeftMouseDown)
 	g_tap = mac.CGEventTapCreate(mac.kCGSessionEventTap, mac.kCGHeadInsertEventTap, mac.kCGEventTapOptionDefault, mask, tap_cb, nil)
 	if g_tap != nil {
 		mac.CFRunLoopAddSource(rl, mac.CFMachPortCreateRunLoopSource(nil, g_tap, 0), mac.kCFRunLoopDefaultMode)
 		mac.CGEventTapEnable(g_tap, true)
+	}
+	if posix.pipe(&g_hotkey_pipe) == .OK {
+		posix.fcntl(g_hotkey_pipe[0], .SETFL, transmute(c.int)posix.O_Flags{.NONBLOCK})
+		hk := mac.CFFileDescriptorCreate(nil, c.int(g_hotkey_pipe[0]), false, hotkey_cb, nil)
+		mac.CFFileDescriptorEnableCallBacks(hk, mac.kCFFileDescriptorReadCallBack)
+		mac.CFRunLoopAddSource(rl, mac.CFFileDescriptorCreateRunLoopSource(nil, hk, 0), mac.kCFRunLoopDefaultMode)
+		g_key_tap = mac.CGEventTapCreate(mac.kCGSessionEventTap, mac.kCGHeadInsertEventTap, mac.kCGEventTapOptionDefault, mac.event_mask_bit(mac.kCGEventKeyDown), key_tap_cb, nil)
+		if g_key_tap != nil do g_key_tap_thread = thread.create_and_start(key_tap_loop)
 	}
 
 	// Periodic reconcile (auto-track + auto-tile when live).
@@ -354,7 +375,7 @@ run_daemon :: proc(manage_app: string = "") {
 	scope := manage_app == "" ? "all apps" : manage_app
 	fmt.printfln("niri-mac daemon listening on %s", SOCKET_PATH)
 	fmt.printfln("  managing %s, TILING (use `wm live off` or Alt+T to pause)", scope)
-	if g_tap != nil && input_ok {
+	if g_key_tap != nil && input_ok {
 		fmt.println("  hotkeys: ENABLED (Alt+hjkl focus, r=width m=maximize g=grid/columns f=float ,/.=consume/expel Alt+Shift+,=group 1-9=focus, Ctrl+1-9=workspace, t=tiling this monitor; Cmd+Tab is native)")
 	} else {
 		fmt.println("  hotkeys: NOT ACTIVE — grant Input Monitoring to your terminal in")
@@ -715,11 +736,11 @@ focus_cb :: proc "c" (timer: mac.CFRunLoopTimer, info: rawptr) {
 			g_last_synced_id = id
 			focus_window_id(id)
 			run_effector(nil) // switch workspace / un-hide / re-tile
-			raise_focused() // re-assert focus after un-minimize
+			raise_focused(warp = false) // re-assert focus after un-minimize
 			update_bar()
 		case .Reassert:
 			g_stale_raise_id = 0
-			raise_focused() // our late-landing write stole frontmost — take it back
+			raise_focused(warp = false) // our late-landing write stole frontmost — take it back
 		case .Ignore, .Arm:
 		}
 	}
@@ -735,21 +756,7 @@ tap_cb :: proc "c" (proxy: mac.CGEventTapProxy, type: u32, event: mac.CGEvent, u
 		if g_tap != nil do mac.CGEventTapEnable(g_tap, true)
 		return event
 	}
-	if type == mac.kCGEventKeyDown {
-		// We only inspect Alt-chords (our keymap) and Ctrl+digit (workspaces);
-		// other keys — including Cmd+Tab — pass straight through, never recorded.
-		flags := mac.CGEventGetFlags(event)
-		if (flags & mac.FLAG_ALT) != 0 || (flags & mac.FLAG_CONTROL) != 0 {
-			keycode := mac.CGEventGetIntegerValueField(event, mac.kCGKeyboardEventKeycode)
-			t0 := mac.CFAbsoluteTimeGetCurrent()
-			handled := dispatch_hotkey(keycode, flags)
-			ms := f64(mac.CFAbsoluteTimeGetCurrent() - t0) * 1000
-			if ms > TAP_SLOW_MS do fmt.printfln("tap dispatch keycode=%d took %.0fms", keycode, ms)
-			if handled {
-				return mac.CGEvent(nil) // consume the keystroke
-			}
-		}
-	} else if type == mac.kCGEventLeftMouseDown {
+	if type == mac.kCGEventLeftMouseDown {
 		loc := mac.CGEventGetLocation(event)
 		if bar_click(f64(loc.x), f64(loc.y)) {
 			return mac.CGEvent(nil) // consumed a click on the bar
@@ -759,6 +766,47 @@ tap_cb :: proc "c" (proxy: mac.CGEventTapProxy, type: u32, event: mac.CGEvent, u
 		g_click_sync = CLICK_SYNC_TICKS
 	}
 	return event
+}
+
+// Keyboard tap thread: its own CFRunLoop, nothing else on it.
+key_tap_loop :: proc() {
+	rl := mac.CFRunLoopGetCurrent()
+	mac.CFRunLoopAddSource(rl, mac.CFMachPortCreateRunLoopSource(nil, g_key_tap, 0), mac.kCFRunLoopDefaultMode)
+	mac.CGEventTapEnable(g_key_tap, true)
+	mac.CFRunLoopRun()
+}
+
+// Runs on the tap thread: consume our chords instantly, forward them to the
+// main thread. Only Alt/Ctrl chords in our keymap are touched; everything
+// else — including Cmd+Tab — passes straight through, never recorded.
+key_tap_cb :: proc "c" (proxy: mac.CGEventTapProxy, type: u32, event: mac.CGEvent, userInfo: rawptr) -> mac.CGEvent {
+	context = runtime.default_context()
+	if type == mac.kCGEventTapDisabledByTimeout || type == mac.kCGEventTapDisabledByUserInput {
+		fmt.printfln("key tap DISABLED: %s — re-enabling", type == mac.kCGEventTapDisabledByTimeout ? "timeout" : "user input")
+		if g_key_tap != nil do mac.CGEventTapEnable(g_key_tap, true)
+		return event
+	}
+	if type != mac.kCGEventKeyDown do return event
+	flags := mac.CGEventGetFlags(event)
+	keycode := mac.CGEventGetIntegerValueField(event, mac.kCGKeyboardEventKeycode)
+	if !hotkey_recognized(keycode, flags) do return event
+	msg := Hotkey_Msg{keycode, flags, mac.CFAbsoluteTimeGetCurrent()}
+	posix.write(g_hotkey_pipe[1], ([^]byte)(rawptr(&msg)), size_of(msg))
+	return mac.CGEvent(nil)
+}
+
+// Main thread: drain forwarded chords and dispatch them.
+@(private = "file")
+hotkey_cb :: proc "c" (f: mac.CFFileDescriptor, types: u64, info: rawptr) {
+	context = runtime.default_context()
+	for {
+		msg: Hotkey_Msg
+		if posix.read(g_hotkey_pipe[0], ([^]byte)(rawptr(&msg)), size_of(msg)) != size_of(msg) do break
+		waited := f64(mac.CFAbsoluteTimeGetCurrent() - msg.at) * 1000
+		if waited > TAP_SLOW_MS do fmt.printfln("hotkey keycode=%d waited %.0fms for the main thread", msg.keycode, waited)
+		dispatch_hotkey(msg.keycode, msg.flags)
+	}
+	mac.CFFileDescriptorEnableCallBacks(f, mac.kCFFileDescriptorReadCallBack)
 }
 
 // Handle a left-click that landed on a status bar: focus the window whose segment
@@ -792,7 +840,7 @@ bar_click :: proc(cx, cy: f64) -> bool {
 		if id != mac.WM_BAR_NONE {
 			focus_window_id(layout.Window_Id(id))
 			run_effector(nil)
-			raise_focused()
+			raise_focused(warp = false)
 		}
 		return true // inside a bar (nothing tiled behind it) — consume
 	}
@@ -820,7 +868,27 @@ stage_focused :: proc() {
 	mac.wm_stage_capture_window(wid)
 }
 
+// Pure: is this chord one of ours? Must agree with dispatch_hotkey — the tap
+// thread consumes on this answer alone, before the main thread acts.
+hotkey_recognized :: proc(keycode: i64, flags: u64) -> bool {
+	alt := (flags & mac.FLAG_ALT) != 0
+	ctrl := (flags & mac.FLAG_CONTROL) != 0
+	if alt && ctrl do return keycode == KEY_J || keycode == KEY_K
+	if ctrl {
+		_, is_digit := digit_for_keycode(keycode)
+		return is_digit
+	}
+	if !alt do return false
+	switch keycode {
+	case KEY_S, KEY_F, KEY_P, KEY_H, KEY_L, KEY_J, KEY_K, KEY_R, KEY_M, KEY_Z, KEY_G, KEY_COMMA, KEY_PERIOD, KEY_T:
+		return true
+	}
+	_, is_digit := digit_for_keycode(keycode)
+	return is_digit
+}
+
 dispatch_hotkey :: proc(keycode: i64, flags: u64) -> bool {
+	if !hotkey_recognized(keycode, flags) do return false
 	shift := (flags & mac.FLAG_SHIFT) != 0
 
 	// Alt+Ctrl+J/K: move the focused window to the next/prev monitor (and follow
@@ -1191,7 +1259,7 @@ focus_column :: proc(n: int) {
 
 // Give the daemon's focused window real keyboard focus (raise + activate app).
 @(private = "file")
-raise_focused :: proc() {
+raise_focused :: proc(warp := true) {
 	id, ok := layout.focused_window(cur_strip())
 	if !ok do return
 	m, found := g.reg[id]
@@ -1216,7 +1284,7 @@ raise_focused :: proc() {
 		// effector just placed it at (m.placed) — no AX read, and it's exactly
 		// where the window is headed even if the async move hasn't landed yet.
 		r := m.placed
-		if r.w > 0 && r.h > 0 {
+		if warp && r.w > 0 && r.h > 0 {
 			mac.warp_mouse(r.x + r.w / 2, r.y + r.h / 2)
 		}
 	}

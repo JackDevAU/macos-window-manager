@@ -2,6 +2,7 @@ package main
 
 import "core:testing"
 import "layout"
+import mac "macos"
 
 // Tests for the daemon's pure tick decisions.
 
@@ -261,4 +262,14 @@ test_orig_for_adopted :: proc(t: ^testing.T) {
 	testing.expect_value(t, orig_for_adopted(parked, false, vp), layout.Rect{300, 190, 400, 300})
 	huge := layout.Rect{-5000, 40, 4000, 3000}
 	testing.expect_value(t, orig_for_adopted(huge, false, vp), vp)
+}
+
+@(test)
+test_hotkey_recognized_matches_keymap :: proc(t: ^testing.T) {
+	testing.expect(t, hotkey_recognized(KEY_H, mac.FLAG_ALT))
+	testing.expect(t, hotkey_recognized(KEY_J, mac.FLAG_ALT | mac.FLAG_CONTROL))
+	testing.expect(t, hotkey_recognized(18, mac.FLAG_CONTROL)) // Ctrl+1
+	testing.expect(t, !hotkey_recognized(KEY_H, mac.FLAG_ALT | mac.FLAG_CONTROL))
+	testing.expect(t, !hotkey_recognized(KEY_TAB, mac.FLAG_COMMAND)) // native Cmd+Tab
+	testing.expect(t, !hotkey_recognized(KEY_H, 0))
 }
